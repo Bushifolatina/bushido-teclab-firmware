@@ -1,0 +1,11 @@
+.DS_Store
+*.swp
+*.tmp
+*.bak
+**/.idea/
+**/.vscode/
+**/build/
+**/dist/
+**/.arduinoIDE/
+**/.arduino/
+**/*.log
