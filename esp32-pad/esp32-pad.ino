@@ -13,6 +13,7 @@ bool hitActive = false;
 
 void setup() {
   Serial.begin(115200);
+  randomSeed(micros());
   delay(1000);
 
   Serial.println("");
@@ -49,7 +50,8 @@ void loop() {
       http.begin(serverUrl);
       http.addHeader("Content-Type", "application/json");
 
-      String jsonPayload = "{\"force_n\":1500,\"zone\":\"center\"}";
+      int force = random(300, 2500);
+      String jsonPayload = "{\"force_n\":" + String(force) + ",\"zone\":\"center\"}";
 
       int httpCode = http.POST(jsonPayload);
 
