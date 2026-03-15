@@ -1,78 +1,91 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
 const char* ssid = "Bedvit";
 const char* password = "Jemma2020";
 
-const char* serverUrl = "https://api.teclab.bushidolatina.com/sessions/c7785909-daee-4073-895a-751b24b7c790/hit";
+const char* serverUrl = "https://api.teclab.bushidolatina.com/device/hit";
+
+const char* deviceId = "COLP-0001";
 
 const int sensorPin = 34;
 const int hitThreshold = 1000;
 
+const unsigned long hitCooldownMs = 1200;
+const unsigned long debugInterval = 1000;
+
 bool hitActive = false;
+unsigned long lastHitTime = 0;
+unsigned long lastDebugTime = 0;
 
 void setup() {
   Serial.begin(115200);
-  randomSeed(micros());
   delay(1000);
 
-  Serial.println("");
-  Serial.println("Booting ESP32...");
+  Serial.println();
+  Serial.println("BOOT ESP32");
 
   WiFi.begin(ssid, password);
 
-  Serial.print("Connecting to WiFi");
+  Serial.print("Connecting WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
 
-  Serial.println("");
-  Serial.println("WiFi connected!");
-  Serial.print("IP address: ");
+  Serial.println();
+  Serial.println("WiFi CONNECTED");
+  Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 
-  Serial.println("FSR + WiFi hit detection ready");
+  Serial.println("Pad Ready");
 }
 
 void loop() {
   int value = analogRead(sensorPin);
+  unsigned long now = millis();
 
-  Serial.print("Sensor value: ");
-  Serial.println(value);
+if (now - lastDebugTime > debugInterval) {
+  lastDebugTime = now;
+}
 
-  if (value < hitThreshold && !hitActive) {
+  if (value < hitThreshold && !hitActive && (now - lastHitTime > hitCooldownMs)) {
     Serial.println("COLPO RILEVATO");
 
     if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
+      WiFiClientSecure client;
+      client.setInsecure();
 
-      http.begin(serverUrl);
+      HTTPClient http;
+      http.begin(client, serverUrl);
       http.addHeader("Content-Type", "application/json");
 
       int force = random(300, 2500);
-      String jsonPayload = "{\"force_n\":" + String(force) + ",\"zone\":\"center\"}";
 
-      int httpCode = http.POST(jsonPayload);
+      String payload = "{\"deviceId\":\"" + String(deviceId) + "\",\"force_n\":" + String(force) + ",\"zone\":\"center\"}";
 
-      Serial.print("HTTP code: ");
+      int httpCode = http.POST(payload);
+
+      Serial.print("HTTP: ");
       Serial.println(httpCode);
 
       if (httpCode > 0) {
-        String payload = http.getString();
-        Serial.print("Server response: ");
-        Serial.println(payload);
+        String response = http.getString();
+        Serial.print("Server: ");
+        Serial.println(response);
       } else {
-        Serial.print("HTTP request failed: ");
+        Serial.print("HTTP ERROR: ");
         Serial.println(http.errorToString(httpCode));
       }
 
       http.end();
     } else {
-      Serial.println("WiFi NOT connected");
+      Serial.println("WiFi NOT CONNECTED");
     }
 
     hitActive = true;
+    lastHitTime = now;
   }
 
   if (value > hitThreshold) {
