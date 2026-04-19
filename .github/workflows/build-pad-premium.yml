@@ -39,10 +39,12 @@ jobs:
           . /opt/esp/idf/export.sh
           idf.py build
 
-      - name: Collect artifacts
+         - name: Collect artifacts
         run: |
           mkdir -p artifacts
           cp build/*.bin artifacts/ || true
+          cp build/bootloader/bootloader.bin artifacts/ || true
+          cp build/partition_table/partition-table.bin artifacts/ || true
           cp build/*.elf artifacts/ || true
           cp build/*.map artifacts/ || true
           cp build/flasher_args.json artifacts/ || true
