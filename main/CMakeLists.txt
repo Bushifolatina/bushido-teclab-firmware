@@ -1,6 +1,31 @@
 idf_component_register(
-    SRCS "main.cpp" "assets/logoteclab.c"
-    INCLUDE_DIRS "."
+    SRCS
+        "main.cpp"
+        "assets/logoteclab.c"
+        "ui/ui.c"
+        "ui/ui_helpers.c"
+        "ui/components/ui_comp.c"
+        "ui/components/ui_comp_aaa.c"
+        "ui/components/ui_comp_hook.c"
+        "ui/components/ui_comp_imgallenamento.c"
+        "ui/images/ui_img_imgallenamento_png.c"
+        "ui/images/ui_img_imgaudio_png.c"
+        "ui/images/ui_img_imgdispositivo_png.c"
+        "ui/images/ui_img_imgimpostazioni_png.c"
+        "ui/images/ui_img_imgwifi_png.c"
+        "ui/images/ui_img_logoteclab_png.c"
+        "ui/screens/ui_HOME.c"
+        "ui/screens/ui_SPLASH.c"
+        "ui/bushido_device_page.c"
+        "ui/bushido_settings_page.c"
+        "ui/bushido_training_page.c"
+        "ui/bushido_training_menu_page.c"
+    INCLUDE_DIRS
+        "."
+        "ui"
+        "ui/components"
+        "ui/screens"
+        "ui/images"
     EMBED_FILES "boot_sound.wav"
     REQUIRES nvs_flash mbedtls esp_http_client esp_port esp_wifi esp_netif
 )

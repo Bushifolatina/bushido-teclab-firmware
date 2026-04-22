@@ -2,6 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include "ui/ui.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -38,6 +39,11 @@
 #include "esp_qmi8658_port.h"
 #include "esp_sdcard_port.h"
 #include "esp_3inch5_lcd_port.h"
+#include "ui/bushido_device_page.h"
+#include "ui/screens/ui_HOME.h"
+#include "ui/bushido_settings_page.h"
+#include "ui/bushido_training_page.h"
+#include "ui/bushido_training_menu_page.h"
 
 extern const uint8_t boot_sound_wav_start[] asm("_binary_boot_sound_wav_start");
 extern const uint8_t boot_sound_wav_end[]   asm("_binary_boot_sound_wav_end");
@@ -140,16 +146,47 @@ static lv_obj_t *wifi_modal = NULL;
 static lv_obj_t *ta_pass = NULL;
 static lv_obj_t *dd_ssid = NULL;
 static lv_obj_t *kb = NULL;
+static lv_obj_t *bushido_diag_panel = NULL;
+static lv_obj_t *bushido_audio_icon = NULL;
 
 // ======================================================
 // STATO RUNTIME PAD
 // ======================================================
+
+static bool bushido_sq_ui_initialized = false;
+static bool bushido_sq_home_bound = false;
+static bool bushido_audio_enabled = true;
 static bool bushido_hit_active = false;
 static int bushido_total_hits = 0;
 static unsigned long bushido_last_hit_ms = 0;
 static unsigned long bushido_last_debug_ms = 0;
 static long bushido_last_loadcell_raw = 0;
 static long bushido_loadcell_offset = 0;
+static int bushido_audio_volume = 80;
+static int bushido_display_brightness = 80;
+static bushido_training_phase_t bushido_training_phase = BUSHIDO_TRAINING_PHASE_IDLE;
+static int bushido_training_timer_seconds = 0;
+static int bushido_training_last_ms = 0;
+static int bushido_training_best_ms = 0;
+static int bushido_training_valid_hits = 0;
+static int bushido_training_false_starts = 0;
+static int bushido_training_target_current = 0;
+static int bushido_training_target_total = 20;
+static bool bushido_training_running = false;
+static TaskHandle_t bushido_training_task_handle = NULL;
+
+static bool bushido_training_paused = false;
+static unsigned long bushido_training_started_at_ms = 0;
+static unsigned long bushido_training_phase_started_ms = 0;
+static unsigned long bushido_training_paused_at_ms = 0;
+static unsigned long bushido_training_unlocked_at_ms = 0;
+static unsigned long bushido_training_random_delay_ms = 0;
+
+static int bushido_training_countdown_value = 3;
+static int bushido_training_random_delay_min_ms = 1500;
+static int bushido_training_random_delay_max_ms = 5000;
+static int bushido_training_allowed_reaction_window_ms = 1500;
+static int bushido_training_false_start_penalty_ms = 2000;
 
 // ======================================================
 // RADIO / ESPNOW
@@ -248,7 +285,31 @@ static int bushido_find_wrist_slot_by_mac(const uint8_t *mac);
 static int bushido_allocate_or_get_wrist_slot(const uint8_t *mac, const char *device_id);
 static int bushido_select_best_wrist_slot(unsigned long hit_ts_ms);
 static int bushido_count_paired_wrists(void);
+static void bushido_bind_squareline_home(void);
+static void bushido_wifi_tile_cb(lv_event_t * e);
+static void bushido_audio_switch_cb(lv_event_t * e);
 static void bushido_update_wrist_ui_summary(const char *last_type, const char *last_device_id, float last_speed);
+static void bushido_open_device_page_cb(lv_event_t *e);
+static void bushido_refresh_device_page_ui(int piezo_value);
+static void bushido_open_settings_page_cb(lv_event_t *e);
+static void bushido_refresh_settings_page_ui(void);
+static void bushido_settings_audio_enabled_changed(bool enabled);
+static void bushido_settings_audio_volume_changed(int volume);
+static void bushido_settings_brightness_changed(int brightness);
+static void bushido_settings_open_wifi(void);
+static void bushido_settings_reboot(void);
+static void open_wifi_manager_cb(lv_event_t * e);
+static void bushido_open_training_page_cb(lv_event_t *e);
+static void bushido_refresh_training_page_ui(void);
+static void bushido_training_start(void);
+static void bushido_training_pause(void);
+static void bushido_training_stop(void);
+static void bushido_open_training_menu_page_cb(lv_event_t *e);
+static void bushido_training_menu_open_reaction(void);
+static void bushido_training_task(void *pvParameters);
+static bool bushido_training_handle_pad_hit(unsigned long now_ms);
+static void bushido_training_enter_phase(bushido_training_phase_t phase, unsigned long now_ms);
+static unsigned long bushido_training_random_between(unsigned long min_ms, unsigned long max_ms);
 
 // ======================================================
 // HELPER
@@ -288,6 +349,398 @@ static void bushido_mac_to_string(const uint8_t *mac, char *buf, size_t buf_len)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+static const char *bushido_training_hint_for_phase(bushido_training_phase_t phase)
+{
+    switch (phase) {
+        case BUSHIDO_TRAINING_PHASE_COUNTDOWN:
+            return "Preparati";
+        case BUSHIDO_TRAINING_PHASE_GO:
+            return "Sessione avviata";
+        case BUSHIDO_TRAINING_PHASE_WAITING_RANDOM:
+            return "Attendi il segnale";
+        case BUSHIDO_TRAINING_PHASE_UNLOCKED:
+            return "Colpisci subito";
+        case BUSHIDO_TRAINING_PHASE_HIT_REGISTERED:
+            return "Reazione valida";
+        case BUSHIDO_TRAINING_PHASE_FALSE_START:
+            return "Colpo anticipato";
+        case BUSHIDO_TRAINING_PHASE_COMPLETED:
+            return "Sessione completata";
+        case BUSHIDO_TRAINING_PHASE_IDLE:
+        default:
+            return "Premi START";
+    }
+}
+
+static unsigned long bushido_training_random_between(unsigned long min_ms, unsigned long max_ms)
+{
+    if (max_ms <= min_ms) return min_ms;
+    return min_ms + (unsigned long)(esp_random() % (max_ms - min_ms + 1));
+}
+
+static void bushido_training_enter_phase(bushido_training_phase_t phase, unsigned long now_ms)
+{
+    bushido_training_phase = phase;
+    bushido_training_phase_started_ms = now_ms;
+
+    switch (phase) {
+        case BUSHIDO_TRAINING_PHASE_COUNTDOWN:
+            bushido_training_countdown_value = 3;
+            break;
+
+        case BUSHIDO_TRAINING_PHASE_WAITING_RANDOM:
+            bushido_training_random_delay_ms = bushido_training_random_between(
+                (unsigned long)bushido_training_random_delay_min_ms,
+                (unsigned long)bushido_training_random_delay_max_ms
+            );
+            break;
+
+        case BUSHIDO_TRAINING_PHASE_UNLOCKED:
+            bushido_training_unlocked_at_ms = now_ms;
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void bushido_refresh_training_page_ui(void)
+{
+    if (!bushido_training_page_get_root()) return;
+
+    char overlay_buf[32] = "";
+
+    if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COUNTDOWN) {
+        lv_snprintf(overlay_buf, sizeof(overlay_buf), "%d", bushido_training_countdown_value);
+    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_GO) {
+        lv_snprintf(overlay_buf, sizeof(overlay_buf), "GO");
+    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_UNLOCKED) {
+        lv_snprintf(overlay_buf, sizeof(overlay_buf), "COLPISCI ORA");
+    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_FALSE_START) {
+        lv_snprintf(overlay_buf, sizeof(overlay_buf), "TROPPO PRESTO");
+    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COMPLETED) {
+        lv_snprintf(overlay_buf, sizeof(overlay_buf), "COMPLETATO");
+    }
+
+    bushido_training_page_data_t data = {};
+    data.mode_label = "REACTION";
+    data.cue_label = "AUDIO+VISIVO";
+    data.hint_label = bushido_training_paused ? "In pausa" : bushido_training_hint_for_phase(bushido_training_phase);
+    data.overlay_text = overlay_buf;
+    data.subtitle = "Reaction Mode";
+
+    data.phase = bushido_training_phase;
+    data.timer_seconds = bushido_training_timer_seconds;
+    data.last_ms = bushido_training_last_ms;
+    data.best_ms = bushido_training_best_ms;
+    data.valid_hits = bushido_training_valid_hits;
+    data.false_starts = bushido_training_false_starts;
+    data.target_current = bushido_training_target_current;
+    data.target_total = bushido_training_target_total;
+
+    data.start_enabled = true;
+    data.pause_enabled = bushido_training_running;
+    data.stop_enabled = true;
+    data.overlay_visible = (overlay_buf[0] != '\0');
+
+    bushido_training_page_refresh(&data);
+}
+
+static void bushido_training_start(void)
+{
+    unsigned long now_ms = (unsigned long)esp_log_timestamp();
+
+    if (bushido_training_paused) {
+        unsigned long pause_delta = now_ms - bushido_training_paused_at_ms;
+        bushido_training_started_at_ms += pause_delta;
+        bushido_training_phase_started_ms += pause_delta;
+        if (bushido_training_unlocked_at_ms > 0) {
+            bushido_training_unlocked_at_ms += pause_delta;
+        }
+        bushido_training_paused = false;
+        bushido_training_running = true;
+        bushido_refresh_training_page_ui();
+        return;
+    }
+
+    bushido_training_running = true;
+    bushido_training_paused = false;
+    bushido_training_timer_seconds = 0;
+    bushido_training_last_ms = 0;
+    bushido_training_best_ms = 0;
+    bushido_training_valid_hits = 0;
+    bushido_training_false_starts = 0;
+    bushido_training_target_current = 0;
+    bushido_training_target_total = 20;
+
+    bushido_training_started_at_ms = now_ms;
+    bushido_training_unlocked_at_ms = 0;
+    bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COUNTDOWN, now_ms);
+    bushido_refresh_training_page_ui();
+}
+
+static void bushido_training_pause(void)
+{
+    if (!bushido_training_running) return;
+
+    bushido_training_running = false;
+    bushido_training_paused = true;
+    bushido_training_paused_at_ms = (unsigned long)esp_log_timestamp();
+    bushido_refresh_training_page_ui();
+}
+
+static void bushido_training_stop(void)
+{
+    bushido_training_running = false;
+    bushido_training_paused = false;
+    bushido_training_phase = BUSHIDO_TRAINING_PHASE_IDLE;
+    bushido_training_timer_seconds = 0;
+    bushido_training_last_ms = 0;
+    bushido_training_best_ms = 0;
+    bushido_training_valid_hits = 0;
+    bushido_training_false_starts = 0;
+    bushido_training_target_current = 0;
+    bushido_training_target_total = 20;
+    bushido_training_countdown_value = 3;
+    bushido_training_started_at_ms = 0;
+    bushido_training_phase_started_ms = 0;
+    bushido_training_unlocked_at_ms = 0;
+    bushido_training_random_delay_ms = 0;
+
+    bushido_refresh_training_page_ui();
+}
+
+static bool bushido_training_handle_pad_hit(unsigned long now_ms)
+{
+    if (!bushido_training_running || bushido_training_paused) {
+        return false;
+    }
+
+    if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_UNLOCKED) {
+        int reaction_ms = (int)(now_ms - bushido_training_unlocked_at_ms);
+
+        if (reaction_ms <= bushido_training_allowed_reaction_window_ms) {
+            bushido_training_last_ms = reaction_ms;
+            bushido_training_valid_hits++;
+            bushido_training_target_current++;
+
+            if (bushido_training_best_ms == 0 || reaction_ms < bushido_training_best_ms) {
+                bushido_training_best_ms = reaction_ms;
+            }
+
+            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_HIT_REGISTERED, now_ms);
+        } else {
+            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+        }
+
+        bushido_refresh_training_page_ui();
+        return true;
+    }
+
+    if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COUNTDOWN ||
+        bushido_training_phase == BUSHIDO_TRAINING_PHASE_GO ||
+        bushido_training_phase == BUSHIDO_TRAINING_PHASE_WAITING_RANDOM) {
+        bushido_training_false_starts++;
+        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_FALSE_START, now_ms);
+        bushido_refresh_training_page_ui();
+        return true;
+    }
+
+    return false;
+}
+
+static void bushido_training_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    while (true) {
+        if (bushido_training_running && !bushido_training_paused) {
+            unsigned long now_ms = (unsigned long)esp_log_timestamp();
+
+            if (bushido_training_started_at_ms > 0) {
+                bushido_training_timer_seconds = (int)((now_ms - bushido_training_started_at_ms) / 1000UL);
+            }
+
+            switch (bushido_training_phase) {
+                case BUSHIDO_TRAINING_PHASE_COUNTDOWN: {
+                    unsigned long elapsed = now_ms - bushido_training_phase_started_ms;
+                    int remaining = 3 - (int)(elapsed / 1000UL);
+
+                    if (remaining < 1) remaining = 1;
+                    bushido_training_countdown_value = remaining;
+
+                    if (elapsed >= 3000UL) {
+                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_GO, now_ms);
+                    }
+                    break;
+                }
+
+                case BUSHIDO_TRAINING_PHASE_GO:
+                    if ((now_ms - bushido_training_phase_started_ms) >= 700UL) {
+                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                    }
+                    break;
+
+                case BUSHIDO_TRAINING_PHASE_WAITING_RANDOM:
+                    if ((now_ms - bushido_training_phase_started_ms) >= bushido_training_random_delay_ms) {
+                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_UNLOCKED, now_ms);
+                    }
+                    break;
+
+                case BUSHIDO_TRAINING_PHASE_UNLOCKED:
+                    if ((now_ms - bushido_training_unlocked_at_ms) >= (unsigned long)bushido_training_allowed_reaction_window_ms) {
+                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                    }
+                    break;
+
+                case BUSHIDO_TRAINING_PHASE_HIT_REGISTERED:
+                    if ((now_ms - bushido_training_phase_started_ms) >= 650UL) {
+                        if (bushido_training_target_current >= bushido_training_target_total) {
+                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COMPLETED, now_ms);
+                            bushido_training_running = false;
+                        } else {
+                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                        }
+                    }
+                    break;
+
+                case BUSHIDO_TRAINING_PHASE_FALSE_START:
+                    if ((now_ms - bushido_training_phase_started_ms) >= (unsigned long)bushido_training_false_start_penalty_ms) {
+                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                    }
+                    break;
+
+                case BUSHIDO_TRAINING_PHASE_COMPLETED:
+                    bushido_training_running = false;
+                    break;
+
+                case BUSHIDO_TRAINING_PHASE_IDLE:
+                default:
+                    break;
+            }
+
+            if (lvgl_port_lock(0)) {
+                bushido_refresh_training_page_ui();
+                lvgl_port_unlock();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void bushido_open_training_page_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!bushido_training_page_get_root()) {
+        bushido_training_page_callbacks_t callbacks = {};
+        callbacks.on_start = bushido_training_start;
+        callbacks.on_pause = bushido_training_pause;
+        callbacks.on_stop = bushido_training_stop;
+
+        bushido_training_page_create(NULL);
+        bushido_training_page_set_home(ui_HOME);
+        bushido_training_page_set_callbacks(&callbacks);
+    }
+
+    bushido_refresh_training_page_ui();
+    bushido_training_page_show();
+}
+
+static void bushido_training_menu_open_reaction(void)
+{
+    bushido_open_training_page_cb(NULL);
+}
+
+static void bushido_open_training_menu_page_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!bushido_training_menu_page_get_root()) {
+        bushido_training_menu_page_callbacks_t callbacks = {};
+        callbacks.on_reaction = bushido_training_menu_open_reaction;
+
+        bushido_training_menu_page_create(NULL);
+        bushido_training_menu_page_set_home(ui_HOME);
+        bushido_training_menu_page_set_callbacks(&callbacks);
+    }
+
+    bushido_training_menu_page_data_t data = {};
+    data.subtitle = "Scegli modalita";
+    data.status_title = "REACTION";
+    data.status_value = "ATTIVO";
+    data.status_hint = "Reaction Mode disponibile";
+
+    bushido_training_menu_page_refresh(&data);
+    bushido_training_menu_page_show();
+}
+
+static void bushido_settings_audio_enabled_changed(bool enabled)
+{
+    bushido_audio_enabled = enabled;
+}
+
+static void bushido_settings_audio_volume_changed(int volume)
+{
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    bushido_audio_volume = volume;
+}
+
+static void bushido_settings_brightness_changed(int brightness)
+{
+    if (brightness < 0) brightness = 0;
+    if (brightness > 100) brightness = 100;
+
+    bushido_display_brightness = brightness;
+    esp_3inch5_brightness_port_set(bushido_display_brightness);
+}
+
+static void bushido_settings_open_wifi(void)
+{
+    open_wifi_manager_cb(NULL);
+}
+
+static void bushido_settings_reboot(void)
+{
+    esp_restart();
+}
+
+static void bushido_refresh_settings_page_ui(void)
+{
+    if (!bushido_settings_page_get_root()) return;
+
+    bushido_settings_page_data_t data = {};
+    data.audio_enabled = bushido_audio_enabled;
+    data.audio_volume = bushido_audio_volume;
+    data.brightness = bushido_display_brightness;
+    data.wifi_text = wifi_status_text;
+
+    bushido_settings_page_refresh(&data);
+}
+
+static void bushido_open_settings_page_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!bushido_settings_page_get_root()) {
+        bushido_settings_page_callbacks_t callbacks = {};
+        callbacks.on_audio_enabled_changed = bushido_settings_audio_enabled_changed;
+        callbacks.on_audio_volume_changed = bushido_settings_audio_volume_changed;
+        callbacks.on_brightness_changed = bushido_settings_brightness_changed;
+        callbacks.on_open_wifi = bushido_settings_open_wifi;
+        callbacks.on_reboot = bushido_settings_reboot;
+
+        bushido_settings_page_create(NULL);
+        bushido_settings_page_set_home(ui_HOME);
+        bushido_settings_page_set_callbacks(&callbacks);
+    }
+
+    bushido_refresh_settings_page_ui();
+    bushido_settings_page_show();
+}
+
 static void bushido_refresh_radio_channel(void)
 {
     wifi_ap_record_t ap_info;
@@ -323,20 +776,13 @@ static void bushido_update_wrist_ui_summary(const char *last_type, const char *l
     if (!wrist_label) return;
     if (!lvgl_port_lock(0)) return;
 
-    char buffer[128];
+    char buffer[96];
     int paired = bushido_count_paired_wrists();
 
     if (last_device_id && strlen(last_device_id) > 0) {
-        snprintf(buffer, sizeof(buffer),
-                 "Wrist(%d/%d): %s | %s | %.1f",
-                 paired, BUSHIDO_MAX_WRISTS,
-                 last_device_id,
-                 (last_type && strlen(last_type) > 0) ? last_type : "-",
-                 last_speed);
+        snprintf(buffer, sizeof(buffer), "W:%d/%d %s %.1f", paired, BUSHIDO_MAX_WRISTS, last_device_id, last_speed);
     } else {
-        snprintf(buffer, sizeof(buffer),
-                 "Wrist(%d/%d): in attesa",
-                 paired, BUSHIDO_MAX_WRISTS);
+        snprintf(buffer, sizeof(buffer), "W:%d/%d in attesa", paired, BUSHIDO_MAX_WRISTS);
     }
 
     lv_label_set_text(wrist_label, buffer);
@@ -581,6 +1027,61 @@ static void connect_btn_cb(lv_event_t * e) {
     }
 }
 
+static void bushido_open_device_page_cb(lv_event_t *e)
+{
+    (void)e;
+
+    bushido_device_page_data_t data = {};
+    data.device_name = "BUSHIDO PAD PRO";
+    data.device_id = BUSHIDO_DEVICE_ID;
+    data.firmware_version = BUSHIDO_FIRMWARE_VERSION;
+    data.hardware_version = BUSHIDO_HARDWARE_VERSION;
+    data.status_text = "ONLINE";
+    data.wifi_text = wifi_status_text;
+    data.radio_channel = g_radio_channel;
+    data.paired_wrists = bushido_count_paired_wrists();
+    data.max_wrists = BUSHIDO_MAX_WRISTS;
+    data.piezo_value = 0;
+    data.loadcell_raw = bushido_last_loadcell_raw;
+    data.loadcell_offset = bushido_loadcell_offset;
+    data.total_hits = bushido_total_hits;
+    data.fw_latest = BUSHIDO_FIRMWARE_VERSION;
+    data.fw_update_text = "manuale";
+
+    if (!bushido_device_page_get_root()) {
+        bushido_device_page_create(NULL);
+        bushido_device_page_set_home(ui_HOME);
+    }
+
+    bushido_device_page_refresh(&data);
+    bushido_device_page_show();
+}
+
+static void bushido_refresh_device_page_ui(int piezo_value)
+{
+    if (!bushido_device_page_get_root()) return;
+
+    bushido_device_page_data_t data = {};
+    data.device_name = "BUSHIDO PAD PRO";
+    data.device_id = BUSHIDO_DEVICE_ID;
+    data.firmware_version = BUSHIDO_FIRMWARE_VERSION;
+    data.hardware_version = BUSHIDO_HARDWARE_VERSION;
+    data.status_text = "ONLINE";
+    data.wifi_text = wifi_status_text;
+    data.radio_channel = g_radio_channel;
+    data.paired_wrists = bushido_count_paired_wrists();
+    data.max_wrists = BUSHIDO_MAX_WRISTS;
+    data.piezo_value = piezo_value;
+    data.loadcell_raw = bushido_last_loadcell_raw;
+    data.loadcell_offset = bushido_loadcell_offset;
+    data.total_hits = bushido_total_hits;
+    data.fw_latest = BUSHIDO_FIRMWARE_VERSION;
+    data.fw_update_text = "manuale";
+
+    bushido_device_page_refresh(&data);
+}
+
+
 static void open_wifi_manager_cb(lv_event_t * e) {
     if (wifi_modal) return;
 
@@ -644,11 +1145,237 @@ static void open_wifi_manager_cb(lv_event_t * e) {
     lv_obj_add_event_cb(btn_close, close_modal_cb, LV_EVENT_CLICKED, NULL);
 }
 
+static void bushido_wifi_tile_cb(lv_event_t * e)
+{
+    (void)e;
+    open_wifi_manager_cb(e);
+}
+
+static void bushido_audio_switch_cb(lv_event_t * e)
+{
+    (void)e;
+
+    if (!ui_Switch2) return;
+
+    bushido_audio_enabled = lv_obj_has_state(ui_Switch2, LV_STATE_CHECKED);
+
+    if (bushido_audio_icon) {
+        lv_obj_set_style_text_color(
+            bushido_audio_icon,
+            bushido_audio_enabled ? lv_color_hex(0xF2F2F2) : lv_color_hex(0x777777),
+            LV_PART_MAIN
+        );
+    }
+
+    ESP_LOGI(TAG, "Audio UI: %s", bushido_audio_enabled ? "ON" : "OFF");
+}
+
+static void bushido_bind_squareline_home(void)
+{
+    if (!ui_HOME || bushido_sq_home_bound) {
+        return;
+    }
+
+    bushido_sq_home_bound = true;
+
+    if (ui_topbar) {
+        lv_obj_clear_flag(ui_topbar, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    title_label = ui_Label2;
+    device_label = ui_lblUser;
+
+    if (title_label) {
+        lv_label_set_text(title_label, "BUSHIDO PAD PRO");
+        lv_obj_set_width(title_label, 150);
+        lv_label_set_long_mode(title_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(title_label, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_label, lv_color_hex(0xFF3B30), LV_PART_MAIN);
+        lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 8, 0);
+    }
+
+    if (device_label) {
+        lv_label_set_text_fmt(device_label, "%s", BUSHIDO_DEVICE_ID);
+        lv_obj_set_width(device_label, 90);
+        lv_label_set_long_mode(device_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(device_label, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(device_label, lv_color_hex(0xE0E0E0), LV_PART_MAIN);
+        lv_obj_align(device_label, LV_ALIGN_LEFT_MID, 165, 0);
+    }
+
+    if (ui_ImgAudion) lv_obj_add_flag(ui_ImgAudion, LV_OBJ_FLAG_HIDDEN);
+    if (ui_imgAllenamento) lv_obj_add_flag(ui_imgAllenamento, LV_OBJ_FLAG_HIDDEN);
+    if (ui_imgDispositivo) lv_obj_add_flag(ui_imgDispositivo, LV_OBJ_FLAG_HIDDEN);
+    if (ui_ImgWifi) lv_obj_add_flag(ui_ImgWifi, LV_OBJ_FLAG_HIDDEN);
+    if (ui_Imgimpostazioni) lv_obj_add_flag(ui_Imgimpostazioni, LV_OBJ_FLAG_HIDDEN);
+
+    if (!bushido_audio_icon) {
+        bushido_audio_icon = lv_label_create(ui_topbar ? ui_topbar : ui_HOME);
+        lv_label_set_text(bushido_audio_icon, LV_SYMBOL_AUDIO);
+        lv_obj_set_style_text_color(
+            bushido_audio_icon,
+            bushido_audio_enabled ? lv_color_hex(0xF2F2F2) : lv_color_hex(0x777777),
+            LV_PART_MAIN
+        );
+        lv_obj_set_style_text_font(bushido_audio_icon, &lv_font_montserrat_16, LV_PART_MAIN);
+
+        if (ui_Switch2) {
+            lv_obj_align_to(bushido_audio_icon, ui_Switch2, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+        } else {
+            lv_obj_align(bushido_audio_icon, LV_ALIGN_TOP_RIGHT, -70, 10);
+        }
+    }
+
+    if (ui_Label1) {
+        lv_label_set_text(ui_Label1, LV_SYMBOL_PLAY "\nALLENAMENTO");
+        lv_obj_set_width(ui_Label1, 150);
+        lv_label_set_long_mode(ui_Label1, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(ui_Label1, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(ui_Label1, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_center(ui_Label1);
+    }
+
+    if (ui_DISPOSITIVO) {
+        lv_label_set_text(ui_DISPOSITIVO, LV_SYMBOL_DRIVE "\nDISPOSITIVO");
+        lv_obj_set_width(ui_DISPOSITIVO, 150);
+        lv_label_set_long_mode(ui_DISPOSITIVO, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(ui_DISPOSITIVO, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(ui_DISPOSITIVO, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_center(ui_DISPOSITIVO);
+    }
+
+    if (ui_WIFI) {
+        lv_label_set_text(ui_WIFI, LV_SYMBOL_WIFI "\nWIFI");
+        lv_obj_set_width(ui_WIFI, 150);
+        lv_label_set_long_mode(ui_WIFI, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(ui_WIFI, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(ui_WIFI, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_center(ui_WIFI);
+    }
+
+    if (ui_IMPOSTAZIONI) {
+        lv_label_set_text(ui_IMPOSTAZIONI, LV_SYMBOL_SETTINGS "\nIMPOSTAZIONI");
+        lv_obj_set_width(ui_IMPOSTAZIONI, 150);
+        lv_label_set_long_mode(ui_IMPOSTAZIONI, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(ui_IMPOSTAZIONI, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(ui_IMPOSTAZIONI, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_center(ui_IMPOSTAZIONI);
+    }
+
+   if (ui_btnallenamento) {
+    lv_obj_add_event_cb(ui_btnallenamento, bushido_open_training_menu_page_cb, LV_EVENT_CLICKED, NULL);
+}
+
+if (ui_btnallenamento2) {
+    lv_obj_add_event_cb(ui_btnallenamento2, bushido_wifi_tile_cb, LV_EVENT_CLICKED, NULL);
+}
+
+if (ui_btnallenamento1) {
+    lv_obj_add_event_cb(ui_btnallenamento1, bushido_open_device_page_cb, LV_EVENT_CLICKED, NULL);
+}
+
+if (ui_btnallenamento3) {
+    lv_obj_add_event_cb(ui_btnallenamento3, bushido_open_settings_page_cb, LV_EVENT_CLICKED, NULL);
+}
+
+    if (ui_Switch2) {
+        if (bushido_audio_enabled) {
+            lv_obj_add_state(ui_Switch2, LV_STATE_CHECKED);
+        } else {
+            lv_obj_clear_state(ui_Switch2, LV_STATE_CHECKED);
+        }
+        lv_obj_add_event_cb(ui_Switch2, bushido_audio_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+
+    if (ui_mainarea) {
+        lv_obj_set_y(ui_mainarea, 42);
+        lv_obj_set_height(ui_mainarea, 178);
+    }
+
+    bushido_diag_panel = lv_obj_create(ui_HOME);
+    lv_obj_set_size(bushido_diag_panel, EXAMPLE_LCD_H_RES - 14, 100);
+    lv_obj_align(bushido_diag_panel, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_clear_flag(bushido_diag_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(bushido_diag_panel, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bushido_diag_panel, lv_color_hex(0x101010), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bushido_diag_panel, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bushido_diag_panel, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(bushido_diag_panel, 1, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(bushido_diag_panel, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(bushido_diag_panel, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(bushido_diag_panel, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(bushido_diag_panel, 8, LV_PART_MAIN);
+
+    lv_obj_t *diag_title = lv_label_create(bushido_diag_panel);
+    lv_label_set_text(diag_title, "LIVE DATA");
+    lv_obj_set_style_text_color(diag_title, lv_color_hex(0xFF3B30), LV_PART_MAIN);
+    lv_obj_set_style_text_font(diag_title, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(diag_title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    status_label = lv_label_create(bushido_diag_panel);
+    lv_label_set_text(status_label, "READY");
+    lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF66), LV_PART_MAIN);
+    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_align(status_label, LV_ALIGN_TOP_RIGHT, 0, -2);
+
+    hits_label = lv_label_create(bushido_diag_panel);
+    lv_obj_set_width(hits_label, 210);
+    lv_label_set_long_mode(hits_label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(hits_label, "Hits: 0");
+    lv_obj_set_style_text_color(hits_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(hits_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(hits_label, LV_ALIGN_TOP_LEFT, 0, 22);
+
+    sensor_label = lv_label_create(bushido_diag_panel);
+    lv_obj_set_width(sensor_label, 210);
+    lv_label_set_long_mode(sensor_label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(sensor_label, "Piezo: 0");
+    lv_obj_set_style_text_color(sensor_label, lv_color_hex(0xCFCFCF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(sensor_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(sensor_label, LV_ALIGN_TOP_RIGHT, 0, 22);
+
+    force_label = lv_label_create(bushido_diag_panel);
+    lv_obj_set_width(force_label, 210);
+    lv_label_set_long_mode(force_label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(force_label, "LC: 0N | SPD:0.0");
+    lv_obj_set_style_text_color(force_label, lv_color_hex(0xFFFF66), LV_PART_MAIN);
+    lv_obj_set_style_text_font(force_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(force_label, LV_ALIGN_TOP_LEFT, 0, 42);
+
+    loadcell_label = lv_label_create(bushido_diag_panel);
+    lv_obj_set_width(loadcell_label, 210);
+    lv_label_set_long_mode(loadcell_label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(loadcell_label, "Raw: 0");
+    lv_obj_set_style_text_color(loadcell_label, lv_color_hex(0x66CCFF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(loadcell_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(loadcell_label, LV_ALIGN_TOP_RIGHT, 0, 42);
+
+    wifi_label = lv_label_create(bushido_diag_panel);
+    lv_obj_set_width(wifi_label, 210);
+    lv_label_set_long_mode(wifi_label, LV_LABEL_LONG_DOT);
+    lv_label_set_text(wifi_label, wifi_status_text);
+    lv_obj_set_style_text_color(wifi_label, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(wifi_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    wrist_label = lv_label_create(bushido_diag_panel);
+    lv_obj_set_width(wrist_label, 210);
+    lv_label_set_long_mode(wrist_label, LV_LABEL_LONG_DOT);
+    lv_label_set_text(wrist_label, "W:0/4 in attesa");
+    lv_obj_set_style_text_color(wrist_label, lv_color_hex(0xFFA500), LV_PART_MAIN);
+    lv_obj_set_style_text_font(wrist_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(wrist_label, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+}
+
 // ======================================================
 // HARDWARE / DISPLAY
 // ======================================================
 void play_embedded_wav()
 {
+    if (!bushido_audio_enabled || bushido_audio_volume <= 0) {
+        return;
+    }
+
     const uint8_t *data = boot_sound_wav_start;
     size_t size = boot_sound_wav_end - boot_sound_wav_start;
 
@@ -662,7 +1389,7 @@ void play_embedded_wav()
 
     extern esp_codec_dev_handle_t output_dev;
 
-    esp_codec_dev_set_out_vol(output_dev, 90.0);
+    esp_codec_dev_set_out_vol(output_dev, (float)bushido_audio_volume);
 
     int err = esp_codec_dev_write(output_dev, (void *)audio, (int)audio_size);
     if (err != ESP_CODEC_DEV_OK) {
@@ -670,7 +1397,7 @@ void play_embedded_wav()
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
-    esp_codec_dev_set_out_vol(output_dev, 0.0);
+    esp_codec_dev_set_out_vol(output_dev, 0.0f);
 }
 
 void i2c_bus_init(void)
@@ -754,78 +1481,75 @@ void lv_port_init(void)
 
 void bushido_show_splash(void)
 {
-    lv_obj_clean(lv_scr_act());
-    lv_obj_t *img = lv_img_create(lv_scr_act());
-    lv_img_set_src(img, &logoteclab);
-    lv_obj_center(img);
+    if (!bushido_sq_ui_initialized) {
+        ui_init();
+        bushido_sq_ui_initialized = true;
+    }
+
+    if (ui_SPLASH) {
+        lv_obj_set_style_bg_color(ui_SPLASH, lv_color_hex(0x050505), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(ui_SPLASH, LV_OPA_COVER, LV_PART_MAIN);
+    }
+
+    if (ui_logoteclab) {
+        lv_obj_add_flag(ui_logoteclab, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (ui_Label3) {
+        lv_label_set_text(ui_Label3, "BUSHIDO TECLAB");
+        lv_obj_set_style_text_color(ui_Label3, lv_color_hex(0xF2F2F2), LV_PART_MAIN);
+        lv_obj_set_style_text_font(ui_Label3, &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_set_style_text_align(ui_Label3, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(ui_Label3, LV_ALIGN_CENTER, 0, -24);
+    }
+
+    if (ui_Label4) {
+        char fw_buf[96];
+        lv_snprintf(fw_buf, sizeof(fw_buf), "Smart Combat Training\nFW %s", BUSHIDO_FIRMWARE_VERSION);
+        lv_label_set_text(ui_Label4, fw_buf);
+        lv_obj_set_style_text_color(ui_Label4, lv_color_hex(0xA8A8A8), LV_PART_MAIN);
+        lv_obj_set_style_text_font(ui_Label4, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_align(ui_Label4, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(ui_Label4, LV_ALIGN_CENTER, 0, 18);
+    }
+
+    if (ui_Bar2) {
+        lv_obj_set_size(ui_Bar2, 170, 8);
+        lv_obj_align(ui_Bar2, LV_ALIGN_BOTTOM_MID, 0, -24);
+        lv_bar_set_value(ui_Bar2, 100, LV_ANIM_OFF);
+    }
+
+    if (ui_SPLASH) {
+        lv_disp_load_scr(ui_SPLASH);
+    }
 }
 
 void bushido_ui_init(void)
 {
-    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, LV_PART_MAIN);
+    if (!bushido_sq_ui_initialized) {
+        ui_init();
+        bushido_sq_ui_initialized = true;
+    }
 
-    title_label = lv_label_create(lv_scr_act());
-    lv_label_set_text_fmt(title_label, "BushidoPad Pro\nFW %s", BUSHIDO_FIRMWARE_VERSION);
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, 16, 14);
+    if (ui_HOME) {
+        lv_disp_load_scr(ui_HOME);
+    }
 
-    device_label = lv_label_create(lv_scr_act());
-    lv_label_set_text_fmt(device_label, "Device: %s\nHW: %s", BUSHIDO_DEVICE_ID, BUSHIDO_HARDWARE_VERSION);
-    lv_obj_set_style_text_color(device_label, lv_color_hex(0xCCCCCC), LV_PART_MAIN);
-    lv_obj_align(device_label, LV_ALIGN_TOP_RIGHT, -70, 14);
+    bushido_bind_squareline_home();
 
-    lv_obj_t * wifi_btn = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(wifi_btn, 45, 45);
-    lv_obj_align(wifi_btn, LV_ALIGN_TOP_RIGHT, -10, 10);
-    lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(0x008888), 0);
-    lv_obj_t * wifi_icn = lv_label_create(wifi_btn);
-    lv_label_set_text(wifi_icn, LV_SYMBOL_WIFI);
-    lv_obj_center(wifi_icn);
-    lv_obj_add_event_cb(wifi_btn, open_wifi_manager_cb, LV_EVENT_CLICKED, NULL);
+    bushido_set_wifi_text(wifi_status_text);
 
-    wifi_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(wifi_label, wifi_status_text);
-    lv_obj_set_style_text_color(wifi_label, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(wifi_label, LV_ALIGN_TOP_LEFT, 16, 78);
+    if (wrist_label) {
+        lv_label_set_text(wrist_label, "W:0/4 in attesa");
+    }
 
-    wrist_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(wrist_label, "Wrist(0/4): in attesa");
-    lv_obj_set_style_text_color(wrist_label, lv_color_hex(0xFFA500), LV_PART_MAIN);
-    lv_obj_set_style_text_font(wrist_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(wrist_label, LV_ALIGN_TOP_LEFT, 16, 100);
+    bushido_refresh_settings_page_ui();
 
-    status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(status_label, "READY");
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF00), LV_PART_MAIN);
-    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 16, 132);
+    bushido_ui_show_ready();
 
-    hits_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(hits_label, "Hits: 0");
-    lv_obj_set_style_text_color(hits_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(hits_label, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(hits_label, LV_ALIGN_TOP_LEFT, 16, 178);
-
-    force_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(force_label, "Forza LC: 0 N (Spd: 0.0)");
-    lv_obj_set_style_text_color(force_label, lv_color_hex(0xFFFF00), LV_PART_MAIN);
-    lv_obj_set_style_text_font(force_label, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(force_label, LV_ALIGN_TOP_LEFT, 16, 216);
-
-    sensor_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(sensor_label, "Piezo: 0");
-    lv_obj_set_style_text_color(sensor_label, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(sensor_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(sensor_label, LV_ALIGN_TOP_LEFT, 16, 254);
-
-    loadcell_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(loadcell_label, "LoadCell raw: 0");
-    lv_obj_set_style_text_color(loadcell_label, lv_color_hex(0x66CCFF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(loadcell_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(loadcell_label, LV_ALIGN_TOP_LEFT, 16, 284);
+    if (force_label) lv_label_set_text(force_label, "LC: 0N | SPD:0.0");
+    if (sensor_label) lv_label_set_text(sensor_label, "Piezo: 0");
+    if (loadcell_label) lv_label_set_text(loadcell_label, "Raw: 0");
 }
 
 void bushido_set_wifi_text(const char *text)
@@ -842,8 +1566,9 @@ void bushido_ui_show_ready(void)
 {
     if (status_label) {
         lv_label_set_text(status_label, "READY");
-        lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF00), LV_PART_MAIN);
+        lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF66), LV_PART_MAIN);
     }
+
     if (hits_label) {
         lv_label_set_text_fmt(hits_label, "Hits: %d", bushido_total_hits);
     }
@@ -855,19 +1580,23 @@ void bushido_ui_show_hit(int force_value, float speed_value, int sensor_value)
         lv_label_set_text(status_label, "COLPO!");
         lv_obj_set_style_text_color(status_label, lv_color_hex(0xFF3333), LV_PART_MAIN);
     }
+
     if (hits_label) {
         lv_label_set_text_fmt(hits_label, "Hits: %d", bushido_total_hits);
     }
+
     if (force_label) {
-        char buf[96];
-        lv_snprintf(buf, sizeof(buf), "Forza LC: %d N (Spd: %.1f)", force_value, speed_value);
+        char buf[64];
+        lv_snprintf(buf, sizeof(buf), "LC:%dN | SPD:%.1f", force_value, speed_value);
         lv_label_set_text(force_label, buf);
     }
+
     if (sensor_label) {
         lv_label_set_text_fmt(sensor_label, "Piezo: %d", sensor_value);
     }
+
     if (loadcell_label) {
-        lv_label_set_text_fmt(loadcell_label, "LoadCell raw: %ld", bushido_last_loadcell_raw);
+        lv_label_set_text_fmt(loadcell_label, "Raw: %ld", bushido_last_loadcell_raw);
     }
 }
 
@@ -1135,14 +1864,19 @@ void bushido_sensor_task(void *pvParameters)
         long lc_abs = bushido_abs_long(bushido_last_loadcell_raw);
         unsigned long now_ms = (unsigned long)esp_log_timestamp();
 
-        if ((now_ms - bushido_last_debug_ms) > BUSHIDO_DEBUG_INTERVAL_MS) {
-            bushido_last_debug_ms = now_ms;
-            if (lvgl_port_lock(0)) {
-                if (sensor_label) lv_label_set_text_fmt(sensor_label, "Piezo: %d", piezo_value);
-                if (loadcell_label) lv_label_set_text_fmt(loadcell_label, "LoadCell raw: %ld", bushido_last_loadcell_raw);
-                lvgl_port_unlock();
-            }
+   if ((now_ms - bushido_last_debug_ms) > BUSHIDO_DEBUG_INTERVAL_MS) {
+    bushido_last_debug_ms = now_ms;
+    if (lvgl_port_lock(0)) {
+        if (sensor_label) lv_label_set_text_fmt(sensor_label, "Piezo: %d", piezo_value);
+        if (loadcell_label) lv_label_set_text_fmt(loadcell_label, "LoadCell raw: %ld", bushido_last_loadcell_raw);
+
+        if (bushido_device_page_get_root()) {
+            bushido_refresh_device_page_ui(piezo_value);
         }
+
+        lvgl_port_unlock();
+    }
+}
 
         // ==================================================
         // TRIGGER PRINCIPALE: CELLA DI CARICO
@@ -1153,10 +1887,22 @@ if (lc_abs > BUSHIDO_LOADCELL_HIT_THRESHOLD &&
 
     int force_value = bushido_loadcell_raw_to_force_n(lc_abs);
     bool has_wrists = bushido_count_paired_wrists() > 0;
+    bool consumed_by_training = false;
+if (bushido_training_running && !bushido_training_paused) {
+    consumed_by_training = bushido_training_handle_pad_hit(now_ms);
+}
 
     bushido_total_hits++;
     bushido_hit_active = true;
     bushido_last_hit_ms = now_ms;
+    if (consumed_by_training) {
+    if (lvgl_port_lock(0)) {
+        bushido_refresh_training_page_ui();
+        lvgl_port_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    continue;
+}
 
     // feedback immediato sul pad
     if (lvgl_port_lock(0)) {
@@ -1482,7 +2228,7 @@ extern "C" void app_main(void)
     bushido_espnow_init();
 
     esp_3inch5_brightness_port_init();
-    esp_3inch5_brightness_port_set(80);
+    esp_3inch5_brightness_port_set(bushido_display_brightness);
 
     vTaskDelay(pdMS_TO_TICKS(150));
     play_embedded_wav();
@@ -1530,7 +2276,7 @@ extern "C" void app_main(void)
 
     xTaskCreate(bushido_sensor_task, "bushido_sensor_task", 4096, NULL, 5, NULL);
     xTaskCreate(bushido_http_task, "bushido_http_task", 6144, NULL, 4, NULL);
-
+    xTaskCreate(bushido_training_task, "bushido_training_task", 4096, NULL, 3, &bushido_training_task_handle);
     ESP_LOGI(TAG, "Bushido Power Pad avviato");
 
     static int connect_attempts = 0;
