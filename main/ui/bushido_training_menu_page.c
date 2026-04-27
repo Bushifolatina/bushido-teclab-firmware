@@ -101,7 +101,11 @@ static void back_btn_event_cb(lv_event_t *e)
 static void libero_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    set_status("LIBERO", "PRESTO", "Modalita non ancora attiva", lv_color_hex(0xFFD60A));
+    set_status("LIBERO", "ATTIVO", "Apre la sessione libera", lv_color_hex(0x32D74B));
+
+    if (g_callbacks.on_free) {
+        g_callbacks.on_free();
+    }
 }
 
 static void countdown_btn_event_cb(lv_event_t *e)
@@ -181,7 +185,7 @@ lv_obj_t *bushido_training_menu_page_create(lv_obj_t *parent)
     lv_label_set_text(btn_back_lbl, LV_SYMBOL_LEFT " HOME");
     lv_obj_center(btn_back_lbl);
 
-    create_mode_btn(g_training_menu_page, "LIBERO", "presto", 10, 74, 145, 64,
+    create_mode_btn(g_training_menu_page, "LIBERO", "attivo", 10, 74, 145, 64,
                     lv_color_hex(0x4A5568), libero_btn_event_cb);
 
     create_mode_btn(g_training_menu_page, "COUNTDOWN", "presto", 167, 74, 145, 64,
@@ -199,7 +203,7 @@ lv_obj_t *bushido_training_menu_page_create(lv_obj_t *parent)
     lv_obj_t *status_card = create_card(g_training_menu_page, "STATO", 10, 222, 460, 88);
 
     lbl_status_title = lv_label_create(status_card);
-    lv_label_set_text(lbl_status_title, "REACTION");
+    lv_label_set_text(lbl_status_title, "LIBERO");
     lv_obj_set_style_text_color(lbl_status_title, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
     lv_obj_set_style_text_font(lbl_status_title, &lv_font_montserrat_12, LV_PART_MAIN);
     lv_obj_set_pos(lbl_status_title, 0, 26);
@@ -213,7 +217,7 @@ lv_obj_t *bushido_training_menu_page_create(lv_obj_t *parent)
     lv_obj_align(lbl_status_value, LV_ALIGN_CENTER, 0, -2);
 
     lbl_status_hint = lv_label_create(status_card);
-    lv_label_set_text(lbl_status_hint, "Reaction Mode disponibile");
+    lv_label_set_text(lbl_status_hint, "Sessione libera disponibile");
     lv_obj_set_width(lbl_status_hint, 430);
     lv_label_set_long_mode(lbl_status_hint, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(lbl_status_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -233,9 +237,9 @@ void bushido_training_menu_page_refresh(const bushido_training_menu_page_data_t 
     }
 
     set_status(
-        (data->status_title && data->status_title[0]) ? data->status_title : "REACTION",
+        (data->status_title && data->status_title[0]) ? data->status_title : "LIBERO",
         (data->status_value && data->status_value[0]) ? data->status_value : "ATTIVO",
-        (data->status_hint && data->status_hint[0]) ? data->status_hint : "Reaction Mode disponibile",
+        (data->status_hint && data->status_hint[0]) ? data->status_hint : "Sessione libera disponibile",
         lv_color_hex(0x32D74B)
     );
 }

@@ -152,6 +152,10 @@ static lv_obj_t *bushido_audio_icon = NULL;
 // ======================================================
 // STATO RUNTIME PAD
 // ======================================================
+typedef enum {
+    BUSHIDO_TRAINING_MODE_FREE = 0,
+    BUSHIDO_TRAINING_MODE_REACTION
+} bushido_training_mode_t;
 
 static bool bushido_sq_ui_initialized = false;
 static bool bushido_sq_home_bound = false;
@@ -164,6 +168,8 @@ static long bushido_last_loadcell_raw = 0;
 static long bushido_loadcell_offset = 0;
 static int bushido_audio_volume = 80;
 static int bushido_display_brightness = 80;
+
+static bushido_training_mode_t bushido_training_mode = BUSHIDO_TRAINING_MODE_REACTION;
 static bushido_training_phase_t bushido_training_phase = BUSHIDO_TRAINING_PHASE_IDLE;
 static int bushido_training_timer_seconds = 0;
 static int bushido_training_last_ms = 0;
@@ -214,17 +220,16 @@ typedef struct __attribute__((packed)) pad_confirm_t {
     int force_value;
 } pad_confirm_t;
 
-// pacchetti futuri per discovery dinamico
 typedef struct __attribute__((packed)) wrist_pair_req_t {
-    char type[16];       // "pair_request"
-    char device_id[16];  // es. BRACC-0001
+    char type[16];
+    char device_id[16];
 } wrist_pair_req_t;
 
 typedef struct __attribute__((packed)) pad_pair_ack_t {
-    char type[16];       // "pair_ack"
-    char device_id[16];  // es. COLP-0001
-    uint8_t channel;     // canale radio attuale pad
-    uint8_t slot_index;  // 0..3
+    char type[16];
+    char device_id[16];
+    uint8_t channel;
+    uint8_t slot_index;
     uint8_t reserved[2];
 } pad_pair_ack_t;
 
@@ -305,6 +310,7 @@ static void bushido_training_start(void);
 static void bushido_training_pause(void);
 static void bushido_training_stop(void);
 static void bushido_open_training_menu_page_cb(lv_event_t *e);
+static void bushido_training_menu_open_free(void);
 static void bushido_training_menu_open_reaction(void);
 static void bushido_training_task(void *pvParameters);
 static bool bushido_training_handle_pad_hit(unsigned long now_ms);
@@ -349,6 +355,21 @@ static void bushido_mac_to_string(const uint8_t *mac, char *buf, size_t buf_len)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+static const char *bushido_training_mode_label(void)
+{
+    return (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) ? "LIBERO" : "REACTION";
+}
+
+static const char *bushido_training_mode_subtitle(void)
+{
+    return (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) ? "Sessione libera" : "Reaction Mode";
+}
+
+static const char *bushido_training_mode_cue_label(void)
+{
+    return (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) ? "PAD LIVE" : "AUDIO+VISIVO";
+}
+
 static const char *bushido_training_hint_for_phase(bushido_training_phase_t phase)
 {
     switch (phase) {
@@ -370,6 +391,17 @@ static const char *bushido_training_hint_for_phase(bushido_training_phase_t phas
         default:
             return "Premi START";
     }
+}
+
+static const char *bushido_training_current_hint(void)
+{
+    if (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) {
+        if (bushido_training_paused) return "In pausa";
+        if (bushido_training_running) return "Colpisci liberamente";
+        return "Premi START";
+    }
+
+    return bushido_training_paused ? "In pausa" : bushido_training_hint_for_phase(bushido_training_phase);
 }
 
 static unsigned long bushido_training_random_between(unsigned long min_ms, unsigned long max_ms)
@@ -410,24 +442,26 @@ static void bushido_refresh_training_page_ui(void)
 
     char overlay_buf[32] = "";
 
-    if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COUNTDOWN) {
-        lv_snprintf(overlay_buf, sizeof(overlay_buf), "%d", bushido_training_countdown_value);
-    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_GO) {
-        lv_snprintf(overlay_buf, sizeof(overlay_buf), "GO");
-    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_UNLOCKED) {
-        lv_snprintf(overlay_buf, sizeof(overlay_buf), "COLPISCI ORA");
-    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_FALSE_START) {
-        lv_snprintf(overlay_buf, sizeof(overlay_buf), "TROPPO PRESTO");
-    } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COMPLETED) {
-        lv_snprintf(overlay_buf, sizeof(overlay_buf), "COMPLETATO");
+    if (bushido_training_mode == BUSHIDO_TRAINING_MODE_REACTION) {
+        if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COUNTDOWN) {
+            lv_snprintf(overlay_buf, sizeof(overlay_buf), "%d", bushido_training_countdown_value);
+        } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_GO) {
+            lv_snprintf(overlay_buf, sizeof(overlay_buf), "GO");
+        } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_UNLOCKED) {
+            lv_snprintf(overlay_buf, sizeof(overlay_buf), "COLPISCI ORA");
+        } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_FALSE_START) {
+            lv_snprintf(overlay_buf, sizeof(overlay_buf), "TROPPO PRESTO");
+        } else if (bushido_training_phase == BUSHIDO_TRAINING_PHASE_COMPLETED) {
+            lv_snprintf(overlay_buf, sizeof(overlay_buf), "COMPLETATO");
+        }
     }
 
     bushido_training_page_data_t data = {};
-    data.mode_label = "REACTION";
-    data.cue_label = "AUDIO+VISIVO";
-    data.hint_label = bushido_training_paused ? "In pausa" : bushido_training_hint_for_phase(bushido_training_phase);
+    data.mode_label = bushido_training_mode_label();
+    data.cue_label = bushido_training_mode_cue_label();
+    data.hint_label = bushido_training_current_hint();
     data.overlay_text = overlay_buf;
-    data.subtitle = "Reaction Mode";
+    data.subtitle = bushido_training_mode_subtitle();
 
     data.phase = bushido_training_phase;
     data.timer_seconds = bushido_training_timer_seconds;
@@ -454,9 +488,11 @@ static void bushido_training_start(void)
         unsigned long pause_delta = now_ms - bushido_training_paused_at_ms;
         bushido_training_started_at_ms += pause_delta;
         bushido_training_phase_started_ms += pause_delta;
+
         if (bushido_training_unlocked_at_ms > 0) {
             bushido_training_unlocked_at_ms += pause_delta;
         }
+
         bushido_training_paused = false;
         bushido_training_running = true;
         bushido_refresh_training_page_ui();
@@ -471,11 +507,17 @@ static void bushido_training_start(void)
     bushido_training_valid_hits = 0;
     bushido_training_false_starts = 0;
     bushido_training_target_current = 0;
-    bushido_training_target_total = 20;
+    bushido_training_target_total = (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) ? 0 : 20;
 
     bushido_training_started_at_ms = now_ms;
     bushido_training_unlocked_at_ms = 0;
-    bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COUNTDOWN, now_ms);
+
+    if (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) {
+        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_GO, now_ms);
+    } else {
+        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COUNTDOWN, now_ms);
+    }
+
     bushido_refresh_training_page_ui();
 }
 
@@ -500,7 +542,7 @@ static void bushido_training_stop(void)
     bushido_training_valid_hits = 0;
     bushido_training_false_starts = 0;
     bushido_training_target_current = 0;
-    bushido_training_target_total = 20;
+    bushido_training_target_total = (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) ? 0 : 20;
     bushido_training_countdown_value = 3;
     bushido_training_started_at_ms = 0;
     bushido_training_phase_started_ms = 0;
@@ -513,6 +555,14 @@ static void bushido_training_stop(void)
 static bool bushido_training_handle_pad_hit(unsigned long now_ms)
 {
     if (!bushido_training_running || bushido_training_paused) {
+        return false;
+    }
+
+    if (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) {
+        bushido_training_valid_hits++;
+        bushido_training_target_current = bushido_training_valid_hits;
+        bushido_training_phase = BUSHIDO_TRAINING_PHASE_GO;
+        bushido_refresh_training_page_ui();
         return false;
     }
 
@@ -561,62 +611,64 @@ static void bushido_training_task(void *pvParameters)
                 bushido_training_timer_seconds = (int)((now_ms - bushido_training_started_at_ms) / 1000UL);
             }
 
-            switch (bushido_training_phase) {
-                case BUSHIDO_TRAINING_PHASE_COUNTDOWN: {
-                    unsigned long elapsed = now_ms - bushido_training_phase_started_ms;
-                    int remaining = 3 - (int)(elapsed / 1000UL);
+            if (bushido_training_mode == BUSHIDO_TRAINING_MODE_REACTION) {
+                switch (bushido_training_phase) {
+                    case BUSHIDO_TRAINING_PHASE_COUNTDOWN: {
+                        unsigned long elapsed = now_ms - bushido_training_phase_started_ms;
+                        int remaining = 3 - (int)(elapsed / 1000UL);
 
-                    if (remaining < 1) remaining = 1;
-                    bushido_training_countdown_value = remaining;
+                        if (remaining < 1) remaining = 1;
+                        bushido_training_countdown_value = remaining;
 
-                    if (elapsed >= 3000UL) {
-                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_GO, now_ms);
+                        if (elapsed >= 3000UL) {
+                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_GO, now_ms);
+                        }
+                        break;
                     }
-                    break;
-                }
 
-                case BUSHIDO_TRAINING_PHASE_GO:
-                    if ((now_ms - bushido_training_phase_started_ms) >= 700UL) {
-                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
-                    }
-                    break;
-
-                case BUSHIDO_TRAINING_PHASE_WAITING_RANDOM:
-                    if ((now_ms - bushido_training_phase_started_ms) >= bushido_training_random_delay_ms) {
-                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_UNLOCKED, now_ms);
-                    }
-                    break;
-
-                case BUSHIDO_TRAINING_PHASE_UNLOCKED:
-                    if ((now_ms - bushido_training_unlocked_at_ms) >= (unsigned long)bushido_training_allowed_reaction_window_ms) {
-                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
-                    }
-                    break;
-
-                case BUSHIDO_TRAINING_PHASE_HIT_REGISTERED:
-                    if ((now_ms - bushido_training_phase_started_ms) >= 650UL) {
-                        if (bushido_training_target_current >= bushido_training_target_total) {
-                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COMPLETED, now_ms);
-                            bushido_training_running = false;
-                        } else {
+                    case BUSHIDO_TRAINING_PHASE_GO:
+                        if ((now_ms - bushido_training_phase_started_ms) >= 700UL) {
                             bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
                         }
-                    }
-                    break;
+                        break;
 
-                case BUSHIDO_TRAINING_PHASE_FALSE_START:
-                    if ((now_ms - bushido_training_phase_started_ms) >= (unsigned long)bushido_training_false_start_penalty_ms) {
-                        bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
-                    }
-                    break;
+                    case BUSHIDO_TRAINING_PHASE_WAITING_RANDOM:
+                        if ((now_ms - bushido_training_phase_started_ms) >= bushido_training_random_delay_ms) {
+                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_UNLOCKED, now_ms);
+                        }
+                        break;
 
-                case BUSHIDO_TRAINING_PHASE_COMPLETED:
-                    bushido_training_running = false;
-                    break;
+                    case BUSHIDO_TRAINING_PHASE_UNLOCKED:
+                        if ((now_ms - bushido_training_unlocked_at_ms) >= (unsigned long)bushido_training_allowed_reaction_window_ms) {
+                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                        }
+                        break;
 
-                case BUSHIDO_TRAINING_PHASE_IDLE:
-                default:
-                    break;
+                    case BUSHIDO_TRAINING_PHASE_HIT_REGISTERED:
+                        if ((now_ms - bushido_training_phase_started_ms) >= 650UL) {
+                            if (bushido_training_target_current >= bushido_training_target_total) {
+                                bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COMPLETED, now_ms);
+                                bushido_training_running = false;
+                            } else {
+                                bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                            }
+                        }
+                        break;
+
+                    case BUSHIDO_TRAINING_PHASE_FALSE_START:
+                        if ((now_ms - bushido_training_phase_started_ms) >= (unsigned long)bushido_training_false_start_penalty_ms) {
+                            bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
+                        }
+                        break;
+
+                    case BUSHIDO_TRAINING_PHASE_COMPLETED:
+                        bushido_training_running = false;
+                        break;
+
+                    case BUSHIDO_TRAINING_PHASE_IDLE:
+                    default:
+                        break;
+                }
             }
 
             if (lvgl_port_lock(0)) {
@@ -648,8 +700,17 @@ static void bushido_open_training_page_cb(lv_event_t *e)
     bushido_training_page_show();
 }
 
+static void bushido_training_menu_open_free(void)
+{
+    bushido_training_mode = BUSHIDO_TRAINING_MODE_FREE;
+    bushido_training_stop();
+    bushido_open_training_page_cb(NULL);
+}
+
 static void bushido_training_menu_open_reaction(void)
 {
+    bushido_training_mode = BUSHIDO_TRAINING_MODE_REACTION;
+    bushido_training_stop();
     bushido_open_training_page_cb(NULL);
 }
 
@@ -659,6 +720,7 @@ static void bushido_open_training_menu_page_cb(lv_event_t *e)
 
     if (!bushido_training_menu_page_get_root()) {
         bushido_training_menu_page_callbacks_t callbacks = {};
+        callbacks.on_free = bushido_training_menu_open_free;
         callbacks.on_reaction = bushido_training_menu_open_reaction;
 
         bushido_training_menu_page_create(NULL);
@@ -668,9 +730,9 @@ static void bushido_open_training_menu_page_cb(lv_event_t *e)
 
     bushido_training_menu_page_data_t data = {};
     data.subtitle = "Scegli modalita";
-    data.status_title = "REACTION";
+    data.status_title = "MENU";
     data.status_value = "ATTIVO";
-    data.status_hint = "Reaction Mode disponibile";
+    data.status_hint = "Libero e Reaction disponibili";
 
     bushido_training_menu_page_refresh(&data);
     bushido_training_menu_page_show();
@@ -1081,7 +1143,6 @@ static void bushido_refresh_device_page_ui(int piezo_value)
     bushido_device_page_refresh(&data);
 }
 
-
 static void open_wifi_manager_cb(lv_event_t * e) {
     if (wifi_modal) return;
 
@@ -1262,21 +1323,21 @@ static void bushido_bind_squareline_home(void)
         lv_obj_center(ui_IMPOSTAZIONI);
     }
 
-   if (ui_btnallenamento) {
-    lv_obj_add_event_cb(ui_btnallenamento, bushido_open_training_menu_page_cb, LV_EVENT_CLICKED, NULL);
-}
+    if (ui_btnallenamento) {
+        lv_obj_add_event_cb(ui_btnallenamento, bushido_open_training_menu_page_cb, LV_EVENT_CLICKED, NULL);
+    }
 
-if (ui_btnallenamento2) {
-    lv_obj_add_event_cb(ui_btnallenamento2, bushido_wifi_tile_cb, LV_EVENT_CLICKED, NULL);
-}
+    if (ui_btnallenamento2) {
+        lv_obj_add_event_cb(ui_btnallenamento2, bushido_wifi_tile_cb, LV_EVENT_CLICKED, NULL);
+    }
 
-if (ui_btnallenamento1) {
-    lv_obj_add_event_cb(ui_btnallenamento1, bushido_open_device_page_cb, LV_EVENT_CLICKED, NULL);
-}
+    if (ui_btnallenamento1) {
+        lv_obj_add_event_cb(ui_btnallenamento1, bushido_open_device_page_cb, LV_EVENT_CLICKED, NULL);
+    }
 
-if (ui_btnallenamento3) {
-    lv_obj_add_event_cb(ui_btnallenamento3, bushido_open_settings_page_cb, LV_EVENT_CLICKED, NULL);
-}
+    if (ui_btnallenamento3) {
+        lv_obj_add_event_cb(ui_btnallenamento3, bushido_open_settings_page_cb, LV_EVENT_CLICKED, NULL);
+    }
 
     if (ui_Switch2) {
         if (bushido_audio_enabled) {
@@ -1864,91 +1925,84 @@ void bushido_sensor_task(void *pvParameters)
         long lc_abs = bushido_abs_long(bushido_last_loadcell_raw);
         unsigned long now_ms = (unsigned long)esp_log_timestamp();
 
-   if ((now_ms - bushido_last_debug_ms) > BUSHIDO_DEBUG_INTERVAL_MS) {
-    bushido_last_debug_ms = now_ms;
-    if (lvgl_port_lock(0)) {
-        if (sensor_label) lv_label_set_text_fmt(sensor_label, "Piezo: %d", piezo_value);
-        if (loadcell_label) lv_label_set_text_fmt(loadcell_label, "LoadCell raw: %ld", bushido_last_loadcell_raw);
+        if ((now_ms - bushido_last_debug_ms) > BUSHIDO_DEBUG_INTERVAL_MS) {
+            bushido_last_debug_ms = now_ms;
+            if (lvgl_port_lock(0)) {
+                if (sensor_label) lv_label_set_text_fmt(sensor_label, "Piezo: %d", piezo_value);
+                if (loadcell_label) lv_label_set_text_fmt(loadcell_label, "LoadCell raw: %ld", bushido_last_loadcell_raw);
 
-        if (bushido_device_page_get_root()) {
-            bushido_refresh_device_page_ui(piezo_value);
-        }
+                if (bushido_device_page_get_root()) {
+                    bushido_refresh_device_page_ui(piezo_value);
+                }
 
-        lvgl_port_unlock();
-    }
-}
-
-        // ==================================================
-        // TRIGGER PRINCIPALE: CELLA DI CARICO
-        // ==================================================
-if (lc_abs > BUSHIDO_LOADCELL_HIT_THRESHOLD &&
-    !bushido_hit_active &&
-    (now_ms - bushido_last_hit_ms > BUSHIDO_HIT_COOLDOWN_MS)) {
-
-    int force_value = bushido_loadcell_raw_to_force_n(lc_abs);
-    bool has_wrists = bushido_count_paired_wrists() > 0;
-    bool consumed_by_training = false;
-if (bushido_training_running && !bushido_training_paused) {
-    consumed_by_training = bushido_training_handle_pad_hit(now_ms);
-}
-
-    bushido_total_hits++;
-    bushido_hit_active = true;
-    bushido_last_hit_ms = now_ms;
-    if (consumed_by_training) {
-    if (lvgl_port_lock(0)) {
-        bushido_refresh_training_page_ui();
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(20));
-    continue;
-}
-
-    // feedback immediato sul pad
-    if (lvgl_port_lock(0)) {
-        bushido_ui_show_hit(force_value, 0.0f, piezo_value);
-        lvgl_port_unlock();
-    }
-
-    if (!has_wrists) {
-        // nessun wrist collegato -> invio immediato senza finestra fusion
-        if (g_hit_queue != NULL) {
-            bushido_hit_event_t event = {};
-            event.force_value = force_value;
-            event.speed_ms = 0.0f;
-            event.angle_deg = 0;
-
-            strncpy(event.strike_type, "unknown", sizeof(event.strike_type) - 1);
-            event.strike_type[sizeof(event.strike_type) - 1] = '\0';
-
-            strncpy(event.zone, "center", sizeof(event.zone) - 1);
-            event.zone[sizeof(event.zone) - 1] = '\0';
-
-            strncpy(event.wrist_device_id, "-", sizeof(event.wrist_device_id) - 1);
-            event.wrist_device_id[sizeof(event.wrist_device_id) - 1] = '\0';
-
-            if (xQueueSend(g_hit_queue, &event, 0) != pdPASS) {
-                ESP_LOGW(TAG, "Coda hit piena, evento scartato");
+                lvgl_port_unlock();
             }
         }
 
-        ESP_LOGW(TAG, "TRIGGER LOADCELL IMMEDIATO -> force=%d | lc_raw=%ld | piezo=%d",
-                 force_value, bushido_last_loadcell_raw, piezo_value);
-    } else {
-        // wrist presente -> aspetta la finestra fusion
-        pending_fusion = true;
-        pending_fusion_ms = now_ms;
-        pending_force_value = force_value;
-        pending_sensor_value = piezo_value;
+        if (lc_abs > BUSHIDO_LOADCELL_HIT_THRESHOLD &&
+            !bushido_hit_active &&
+            (now_ms - bushido_last_hit_ms > BUSHIDO_HIT_COOLDOWN_MS)) {
 
-        ESP_LOGW(TAG, "TRIGGER LOADCELL FUSION -> force=%d | lc_raw=%ld | piezo=%d",
-                 force_value, bushido_last_loadcell_raw, piezo_value);
-    }
-}
+            int force_value = bushido_loadcell_raw_to_force_n(lc_abs);
+            bool has_wrists = bushido_count_paired_wrists() > 0;
+            bool consumed_by_training = false;
 
-        // ==================================================
-        // FINESTRA DI FUSIONE COL BRACCIALE
-        // ==================================================
+            if (bushido_training_running && !bushido_training_paused) {
+                consumed_by_training = bushido_training_handle_pad_hit(now_ms);
+            }
+
+            bushido_total_hits++;
+            bushido_hit_active = true;
+            bushido_last_hit_ms = now_ms;
+
+            if (consumed_by_training) {
+                if (lvgl_port_lock(0)) {
+                    bushido_refresh_training_page_ui();
+                    lvgl_port_unlock();
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
+            if (lvgl_port_lock(0)) {
+                bushido_ui_show_hit(force_value, 0.0f, piezo_value);
+                lvgl_port_unlock();
+            }
+
+            if (!has_wrists) {
+                if (g_hit_queue != NULL) {
+                    bushido_hit_event_t event = {};
+                    event.force_value = force_value;
+                    event.speed_ms = 0.0f;
+                    event.angle_deg = 0;
+
+                    strncpy(event.strike_type, "unknown", sizeof(event.strike_type) - 1);
+                    event.strike_type[sizeof(event.strike_type) - 1] = '\0';
+
+                    strncpy(event.zone, "center", sizeof(event.zone) - 1);
+                    event.zone[sizeof(event.zone) - 1] = '\0';
+
+                    strncpy(event.wrist_device_id, "-", sizeof(event.wrist_device_id) - 1);
+                    event.wrist_device_id[sizeof(event.wrist_device_id) - 1] = '\0';
+
+                    if (xQueueSend(g_hit_queue, &event, 0) != pdPASS) {
+                        ESP_LOGW(TAG, "Coda hit piena, evento scartato");
+                    }
+                }
+
+                ESP_LOGW(TAG, "TRIGGER LOADCELL IMMEDIATO -> force=%d | lc_raw=%ld | piezo=%d",
+                         force_value, bushido_last_loadcell_raw, piezo_value);
+            } else {
+                pending_fusion = true;
+                pending_fusion_ms = now_ms;
+                pending_force_value = force_value;
+                pending_sensor_value = piezo_value;
+
+                ESP_LOGW(TAG, "TRIGGER LOADCELL FUSION -> force=%d | lc_raw=%ld | piezo=%d",
+                         force_value, bushido_last_loadcell_raw, piezo_value);
+            }
+        }
+
         if (pending_fusion && (now_ms - pending_fusion_ms >= BUSHIDO_FUSION_DELAY_MS)) {
             pending_fusion = false;
 
@@ -2006,9 +2060,6 @@ if (bushido_training_running && !bushido_training_paused) {
             }
         }
 
-        // ==================================================
-        // RELEASE CELLA DI CARICO
-        // ==================================================
         if (lc_abs < BUSHIDO_LOADCELL_RELEASE_TH) {
             if (bushido_hit_active && !pending_fusion) {
                 if (lvgl_port_lock(0)) {
@@ -2032,9 +2083,6 @@ static void bushido_espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, cons
         return;
     }
 
-    // --------------------------------------------------
-    // FUTURO: richiesta pairing esplicita dal wrist
-    // --------------------------------------------------
     if (data_len == (int)sizeof(wrist_pair_req_t)) {
         wrist_pair_req_t req = {};
         memcpy(&req, data, sizeof(req));
@@ -2060,9 +2108,6 @@ static void bushido_espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, cons
         return;
     }
 
-    // --------------------------------------------------
-    // MODALITA' ATTUALE / COMPATIBILITA': wrist_data_t
-    // --------------------------------------------------
     if (data_len == (int)sizeof(wrist_data_t)) {
         wrist_data_t incoming_wrist_data = {};
         memcpy(&incoming_wrist_data, data, sizeof(incoming_wrist_data));
@@ -2182,7 +2227,6 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // fallback iniziale se il pad non è ancora connesso al router
     ESP_ERROR_CHECK(esp_wifi_set_channel(BUSHIDO_ESPNOW_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE));
     g_radio_channel = BUSHIDO_ESPNOW_FALLBACK_CHANNEL;
 

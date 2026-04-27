@@ -14,6 +14,7 @@ typedef struct {
 } bushido_training_menu_page_data_t;
 
 typedef struct {
+    void (*on_free)(void);
     void (*on_reaction)(void);
 } bushido_training_menu_page_callbacks_t;
 
