@@ -200,13 +200,13 @@ lv_obj_t *bushido_training_menu_page_create(lv_obj_t *parent)
     create_mode_btn(g_training_menu_page, "REACTION", "attivo", 245, 148, 225, 64,
                     lv_color_hex(0x1E7F37), reaction_btn_event_cb);
 
-    lv_obj_t *status_card = create_card(g_training_menu_page, "STATO", 10, 222, 460, 88);
+    lv_obj_t *status_card = create_card(g_training_menu_page, "STATO", 10, 218, 460, 92);
 
     lbl_status_title = lv_label_create(status_card);
     lv_label_set_text(lbl_status_title, "LIBERO");
     lv_obj_set_style_text_color(lbl_status_title, lv_color_hex(0xAFAFAF), LV_PART_MAIN);
     lv_obj_set_style_text_font(lbl_status_title, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_pos(lbl_status_title, 0, 26);
+    lv_obj_set_pos(lbl_status_title, 0, 22);
 
     lbl_status_value = lv_label_create(status_card);
     lv_label_set_text(lbl_status_value, "ATTIVO");
@@ -214,16 +214,17 @@ lv_obj_t *bushido_training_menu_page_create(lv_obj_t *parent)
     lv_label_set_long_mode(lbl_status_value, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(lbl_status_value, lv_color_hex(0x32D74B), LV_PART_MAIN);
     lv_obj_set_style_text_font(lbl_status_value, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(lbl_status_value, LV_ALIGN_CENTER, 0, -2);
+    lv_obj_set_style_text_align(lbl_status_value, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_set_pos(lbl_status_value, 0, 38);
 
     lbl_status_hint = lv_label_create(status_card);
     lv_label_set_text(lbl_status_hint, "Sessione libera disponibile");
     lv_obj_set_width(lbl_status_hint, 430);
     lv_label_set_long_mode(lbl_status_hint, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(lbl_status_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_align(lbl_status_hint, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl_status_hint, lv_color_hex(0xB0B0B0), LV_PART_MAIN);
     lv_obj_set_style_text_font(lbl_status_hint, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_align(lbl_status_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_pos(lbl_status_hint, 0, 66);
 
     return g_training_menu_page;
 }
