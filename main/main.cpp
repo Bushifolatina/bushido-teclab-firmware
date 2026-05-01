@@ -2325,6 +2325,7 @@ extern "C" void app_main(void)
 
     static int connect_attempts = 0;
     static uint8_t last_logged_channel = 0;
+    static unsigned long last_reconnect_attempt_ms = 0;
 
     while (1) {
         wifi_ap_record_t ap_info;
@@ -2361,10 +2362,51 @@ extern "C" void app_main(void)
                     snprintf(wifi_status_text, sizeof(wifi_status_text), "WiFi: DISCONNESSO");
                     update_wifi_ui_status(wifi_status_text, lv_color_hex(0xFF0000));
                 }
-            } else if (wifi_connected || strcmp(wifi_status_text, "WiFi: DISCONNESSO") != 0) {
+            } else {
                 wifi_connected = false;
-                snprintf(wifi_status_text, sizeof(wifi_status_text), "WiFi: DISCONNESSO");
-                update_wifi_ui_status(wifi_status_text, lv_color_hex(0xFF0000));
+
+                if (strcmp(wifi_status_text, "WiFi: DISCONNESSO") != 0) {
+                    snprintf(wifi_status_text, sizeof(wifi_status_text), "WiFi: DISCONNESSO");
+                    update_wifi_ui_status(wifi_status_text, lv_color_hex(0xFF0000));
+                }
+
+                unsigned long now_ms = (unsigned long)esp_log_timestamp();
+                if ((now_ms - last_reconnect_attempt_ms) >= 8000UL) {
+                    last_reconnect_attempt_ms = now_ms;
+
+                    wifi_config_t wifi_config = {};
+                    strncpy((char *)wifi_config.sta.ssid, bushido_ssid, sizeof(wifi_config.sta.ssid) - 1);
+                    strncpy((char *)wifi_config.sta.password, bushido_pass, sizeof(wifi_config.sta.password) - 1);
+
+                    if (strlen(bushido_pass) == 0) {
+                        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+                    } else {
+                        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+                        wifi_config.sta.pmf_cfg.capable = true;
+                        wifi_config.sta.pmf_cfg.required = false;
+                    }
+
+                    esp_err_t err_dis = esp_wifi_disconnect();
+                    if (err_dis != ESP_OK && err_dis != ESP_ERR_WIFI_NOT_CONNECT) {
+                        ESP_LOGW(TAG, "Auto reconnect disconnect: %s", esp_err_to_name(err_dis));
+                    }
+
+                    esp_err_t err_cfg = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+                    if (err_cfg != ESP_OK) {
+                        ESP_LOGE(TAG, "Auto reconnect set_config failed: %s", esp_err_to_name(err_cfg));
+                    } else {
+                        esp_err_t err_conn = esp_wifi_connect();
+                        if (err_conn == ESP_OK) {
+                            wifi_connecting = true;
+                            connect_attempts = 0;
+                            snprintf(wifi_status_text, sizeof(wifi_status_text), "WiFi: riconnessione a %s...", bushido_ssid);
+                            update_wifi_ui_status(wifi_status_text, lv_color_hex(0xFFFF00));
+                            ESP_LOGI(TAG, "Tentativo auto-riconnessione WiFi a %s", bushido_ssid);
+                        } else {
+                            ESP_LOGE(TAG, "Auto reconnect failed: %s", esp_err_to_name(err_conn));
+                        }
+                    }
+                }
             }
         }
 
