@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -80,6 +81,7 @@ static const char *BUSHIDO_HARDWARE_VERSION = "revA";
 static char bushido_ssid[33] = "";
 static char bushido_pass[64] = "";
 static const char *BUSHIDO_BACKEND_HIT_URL = "https://api.teclab.bushidolatina.com/device/hit";
+static const char *BUSHIDO_BACKEND_SESSION_STATE_URL = "https://api.teclab.bushidolatina.com/device/session-state";
 
 static bool wifi_connecting = false;
 static bool wifi_connected = false;
@@ -182,6 +184,8 @@ static bool bushido_training_running = false;
 static TaskHandle_t bushido_training_task_handle = NULL;
 
 static bool bushido_training_paused = false;
+static bool bushido_backend_session_active = false;
+static char bushido_backend_session_id[48] = "";
 static unsigned long bushido_training_started_at_ms = 0;
 static unsigned long bushido_training_phase_started_ms = 0;
 static unsigned long bushido_training_paused_at_ms = 0;
@@ -259,6 +263,7 @@ typedef struct {
 } bushido_hit_event_t;
 
 static QueueHandle_t g_hit_queue = NULL;
+static SemaphoreHandle_t g_http_mutex = NULL;
 
 // ======================================================
 // FORWARD DECL
@@ -279,6 +284,8 @@ long bushido_hx711_read_raw(void);
 void bushido_sensor_task(void *pvParameters);
 void bushido_http_task(void *pvParameters);
 void send_hit_to_backend(int force_value, float speed_value, int angle_deg, const char* strike_type, const char *zone_value);
+bool bushido_send_session_state_to_backend(const char *status, const char *phase);
+void bushido_sync_training_session_tick(void);
 void bushido_espnow_init(void);
 
 static int bushido_loadcell_raw_to_force_n(long raw_abs);
@@ -316,6 +323,8 @@ static void bushido_training_task(void *pvParameters);
 static bool bushido_training_handle_pad_hit(unsigned long now_ms);
 static void bushido_training_enter_phase(bushido_training_phase_t phase, unsigned long now_ms);
 static unsigned long bushido_training_random_between(unsigned long min_ms, unsigned long max_ms);
+static const char *bushido_backend_mode_string(void);
+static const char *bushido_backend_phase_string(void);
 
 // ======================================================
 // HELPER
@@ -495,9 +504,13 @@ static void bushido_training_start(void)
 
         bushido_training_paused = false;
         bushido_training_running = true;
+        bushido_send_session_state_to_backend("running", bushido_backend_phase_string());
         bushido_refresh_training_page_ui();
         return;
     }
+
+    bushido_backend_session_active = false;
+    bushido_backend_session_id[0] = '\0';
 
     bushido_training_running = true;
     bushido_training_paused = false;
@@ -518,6 +531,7 @@ static void bushido_training_start(void)
         bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COUNTDOWN, now_ms);
     }
 
+    bushido_send_session_state_to_backend("running", bushido_backend_phase_string());
     bushido_refresh_training_page_ui();
 }
 
@@ -528,11 +542,24 @@ static void bushido_training_pause(void)
     bushido_training_running = false;
     bushido_training_paused = true;
     bushido_training_paused_at_ms = (unsigned long)esp_log_timestamp();
+    bushido_send_session_state_to_backend("paused", bushido_backend_phase_string());
     bushido_refresh_training_page_ui();
 }
 
 static void bushido_training_stop(void)
 {
+    bool should_notify_end =
+        bushido_backend_session_active ||
+        bushido_training_running ||
+        bushido_training_paused ||
+        (bushido_training_started_at_ms > 0);
+
+    if (should_notify_end) {
+        bushido_send_session_state_to_backend("ended", "completed");
+    }
+
+    bushido_backend_session_active = false;
+    bushido_backend_session_id[0] = '\0';
     bushido_training_running = false;
     bushido_training_paused = false;
     bushido_training_phase = BUSHIDO_TRAINING_PHASE_IDLE;
@@ -648,6 +675,9 @@ static void bushido_training_task(void *pvParameters)
                         if ((now_ms - bushido_training_phase_started_ms) >= 650UL) {
                             if (bushido_training_target_current >= bushido_training_target_total) {
                                 bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COMPLETED, now_ms);
+                                bushido_send_session_state_to_backend("ended", "completed");
+                                bushido_backend_session_active = false;
+                                bushido_backend_session_id[0] = '\0';
                                 bushido_training_running = false;
                             } else {
                                 bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_WAITING_RANDOM, now_ms);
@@ -670,6 +700,8 @@ static void bushido_training_task(void *pvParameters)
                         break;
                 }
             }
+
+            bushido_sync_training_session_tick();
 
             if (lvgl_port_lock(0)) {
                 bushido_refresh_training_page_ui();
@@ -1733,6 +1765,16 @@ long bushido_hx711_read_raw(void)
 // ======================================================
 void send_hit_to_backend(int force_value, float speed_value, int angle_deg, const char* strike_type, const char *zone_value)
 {
+    if (!wifi_connected) {
+        ESP_LOGW(TAG, "Hit non inviato: WiFi non connesso");
+        return;
+    }
+
+    if (g_http_mutex && xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "HTTP busy: hit scartato");
+        return;
+    }
+
     char payload[512];
 
     const char *safe_type = (strike_type && strlen(strike_type) > 0) ? strike_type : "unknown";
@@ -1764,12 +1806,13 @@ void send_hit_to_backend(int force_value, float speed_value, int angle_deg, cons
     esp_http_client_config_t config = {};
     config.url = BUSHIDO_BACKEND_HIT_URL;
     config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 5000;
+    config.timeout_ms = 4000;
     config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
         ESP_LOGE(TAG, "HTTP client init failed");
+        if (g_http_mutex) xSemaphoreGive(g_http_mutex);
         return;
     }
 
@@ -1796,6 +1839,180 @@ void send_hit_to_backend(int force_value, float speed_value, int angle_deg, cons
     }
 
     esp_http_client_cleanup(client);
+    if (g_http_mutex) xSemaphoreGive(g_http_mutex);
+}
+
+static const char *bushido_backend_mode_string(void)
+{
+    return (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) ? "free" : "reaction";
+}
+
+static const char *bushido_backend_phase_string(void)
+{
+    if (bushido_training_mode == BUSHIDO_TRAINING_MODE_FREE) {
+        if (bushido_training_paused) return "paused";
+        if (bushido_training_running) return "active";
+        return "idle";
+    }
+
+    switch (bushido_training_phase) {
+        case BUSHIDO_TRAINING_PHASE_COUNTDOWN:
+            return "countdown";
+        case BUSHIDO_TRAINING_PHASE_GO:
+            return "go";
+        case BUSHIDO_TRAINING_PHASE_WAITING_RANDOM:
+            return "waiting_random";
+        case BUSHIDO_TRAINING_PHASE_UNLOCKED:
+            return "unlocked";
+        case BUSHIDO_TRAINING_PHASE_HIT_REGISTERED:
+            return "hit_registered";
+        case BUSHIDO_TRAINING_PHASE_FALSE_START:
+            return "false_start";
+        case BUSHIDO_TRAINING_PHASE_COMPLETED:
+            return "completed";
+        case BUSHIDO_TRAINING_PHASE_IDLE:
+        default:
+            return "idle";
+    }
+}
+
+bool bushido_send_session_state_to_backend(const char *status, const char *phase)
+{
+    if (!wifi_connected) {
+        ESP_LOGW(TAG, "Session state non inviato: WiFi non connesso");
+        return false;
+    }
+
+    if (g_http_mutex && xSemaphoreTake(g_http_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "HTTP busy: session-state saltato");
+        return false;
+    }
+
+    char payload[768];
+    char response[512];
+    memset(response, 0, sizeof(response));
+
+    const char *safe_status = (status && strlen(status) > 0) ? status : "running";
+    const char *safe_phase = (phase && strlen(phase) > 0) ? phase : "active";
+    const char *mode = bushido_backend_mode_string();
+
+    unsigned long now_ms = (unsigned long)esp_log_timestamp();
+    unsigned long elapsed_ms = 0;
+
+    if (bushido_training_started_at_ms > 0) {
+        unsigned long ref_ms = bushido_training_paused ? bushido_training_paused_at_ms : now_ms;
+        if (ref_ms >= bushido_training_started_at_ms) {
+            elapsed_ms = ref_ms - bushido_training_started_at_ms;
+        }
+    }
+
+    if (bushido_backend_session_active && strlen(bushido_backend_session_id) > 0) {
+        snprintf(
+            payload,
+            sizeof(payload),
+            "{\"deviceId\":\"%s\",\"sessionId\":\"%s\",\"mode\":\"%s\",\"status\":\"%s\",\"phase\":\"%s\",\"elapsedMs\":%lu,\"paused\":%s}",
+            BUSHIDO_DEVICE_ID,
+            bushido_backend_session_id,
+            mode,
+            safe_status,
+            safe_phase,
+            elapsed_ms,
+            bushido_training_paused ? "true" : "false"
+        );
+    } else {
+        snprintf(
+            payload,
+            sizeof(payload),
+            "{\"deviceId\":\"%s\",\"mode\":\"%s\",\"status\":\"%s\",\"phase\":\"%s\",\"elapsedMs\":%lu,\"paused\":%s}",
+            BUSHIDO_DEVICE_ID,
+            mode,
+            safe_status,
+            safe_phase,
+            elapsed_ms,
+            bushido_training_paused ? "true" : "false"
+        );
+    }
+
+    esp_http_client_config_t config = {};
+    config.url = BUSHIDO_BACKEND_SESSION_STATE_URL;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 4000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "HTTP session-state client init failed");
+        if (g_http_mutex) xSemaphoreGive(g_http_mutex);
+        return false;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, payload, strlen(payload));
+
+    ESP_LOGI(TAG, "Invio session-state: %s", payload);
+
+    esp_err_t err = esp_http_client_perform(client);
+    bool ok = false;
+
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        int read_len = esp_http_client_read_response(client, response, sizeof(response) - 1);
+
+        if (read_len < 0) read_len = 0;
+        response[read_len] = '\0';
+
+        ESP_LOGI(TAG, "Session-state HTTP Status: %d", status_code);
+        ESP_LOGI(TAG, "Session-state response: %s", response);
+
+        if (status_code >= 200 && status_code < 300) {
+            const char *key = "\"session_id\":\"";
+            char *start = strstr(response, key);
+
+            if (start) {
+                start += strlen(key);
+                char *end = strchr(start, '\"');
+                if (end) {
+                    size_t len = (size_t)(end - start);
+                    if (len >= sizeof(bushido_backend_session_id)) {
+                        len = sizeof(bushido_backend_session_id) - 1;
+                    }
+                    memcpy(bushido_backend_session_id, start, len);
+                    bushido_backend_session_id[len] = '\0';
+                    bushido_backend_session_active = true;
+                }
+            }
+
+            if (strcmp(safe_status, "ended") == 0) {
+                bushido_backend_session_active = false;
+                bushido_backend_session_id[0] = '\0';
+            }
+
+            ok = true;
+        }
+    } else {
+        ESP_LOGE(TAG, "HTTP session-state failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    if (g_http_mutex) xSemaphoreGive(g_http_mutex);
+    return ok;
+}
+
+void bushido_sync_training_session_tick(void)
+{
+    static unsigned long last_sync_ms = 0;
+
+    if (!wifi_connected || !bushido_training_running || bushido_training_paused) {
+        return;
+    }
+
+    unsigned long now_ms = (unsigned long)esp_log_timestamp();
+    if ((now_ms - last_sync_ms) < 1500UL) {
+        return;
+    }
+
+    last_sync_ms = now_ms;
+    bushido_send_session_state_to_backend("running", bushido_backend_phase_string());
 }
 
 static esp_err_t bushido_register_wrist_peer(const uint8_t *mac)
@@ -2316,6 +2533,11 @@ extern "C" void app_main(void)
     g_hit_queue = xQueueCreate(10, sizeof(bushido_hit_event_t));
     if (g_hit_queue == NULL) {
         ESP_LOGE(TAG, "Errore creazione coda hit");
+    }
+
+    g_http_mutex = xSemaphoreCreateMutex();
+    if (g_http_mutex == NULL) {
+        ESP_LOGE(TAG, "Errore creazione mutex HTTP");
     }
 
     xTaskCreate(bushido_sensor_task, "bushido_sensor_task", 4096, NULL, 5, NULL);
