@@ -262,7 +262,13 @@ typedef struct {
     char wrist_device_id[16];
 } bushido_hit_event_t;
 
+typedef struct {
+    char status[16];
+    char phase[24];
+} bushido_session_state_event_t;
+
 static QueueHandle_t g_hit_queue = NULL;
+static QueueHandle_t g_session_state_queue = NULL;
 static SemaphoreHandle_t g_http_mutex = NULL;
 
 // ======================================================
@@ -285,6 +291,7 @@ void bushido_sensor_task(void *pvParameters);
 void bushido_http_task(void *pvParameters);
 void send_hit_to_backend(int force_value, float speed_value, int angle_deg, const char* strike_type, const char *zone_value);
 bool bushido_send_session_state_to_backend(const char *status, const char *phase);
+bool bushido_queue_session_state(const char *status, const char *phase);
 void bushido_sync_training_session_tick(void);
 void bushido_espnow_init(void);
 
@@ -504,7 +511,7 @@ static void bushido_training_start(void)
 
         bushido_training_paused = false;
         bushido_training_running = true;
-        bushido_send_session_state_to_backend("running", bushido_backend_phase_string());
+        bushido_queue_session_state("running", bushido_backend_phase_string());
         bushido_refresh_training_page_ui();
         return;
     }
@@ -531,7 +538,7 @@ static void bushido_training_start(void)
         bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COUNTDOWN, now_ms);
     }
 
-    bushido_send_session_state_to_backend("running", bushido_backend_phase_string());
+    bushido_queue_session_state("running", bushido_backend_phase_string());
     bushido_refresh_training_page_ui();
 }
 
@@ -542,7 +549,7 @@ static void bushido_training_pause(void)
     bushido_training_running = false;
     bushido_training_paused = true;
     bushido_training_paused_at_ms = (unsigned long)esp_log_timestamp();
-    bushido_send_session_state_to_backend("paused", bushido_backend_phase_string());
+    bushido_queue_session_state("paused", bushido_backend_phase_string());
     bushido_refresh_training_page_ui();
 }
 
@@ -555,7 +562,7 @@ static void bushido_training_stop(void)
         (bushido_training_started_at_ms > 0);
 
     if (should_notify_end) {
-        bushido_send_session_state_to_backend("ended", "completed");
+        bushido_queue_session_state("ended", "completed");
     }
 
     bushido_backend_session_active = false;
@@ -675,7 +682,7 @@ static void bushido_training_task(void *pvParameters)
                         if ((now_ms - bushido_training_phase_started_ms) >= 650UL) {
                             if (bushido_training_target_current >= bushido_training_target_total) {
                                 bushido_training_enter_phase(BUSHIDO_TRAINING_PHASE_COMPLETED, now_ms);
-                                bushido_send_session_state_to_backend("ended", "completed");
+                                bushido_queue_session_state("ended", "completed");
                                 bushido_backend_session_active = false;
                                 bushido_backend_session_id[0] = '\0';
                                 bushido_training_running = false;
@@ -1876,6 +1883,32 @@ static const char *bushido_backend_phase_string(void)
     }
 }
 
+bool bushido_queue_session_state(const char *status, const char *phase)
+{
+    if (g_session_state_queue == NULL) {
+        ESP_LOGW(TAG, "Queue session-state non disponibile");
+        return false;
+    }
+
+    bushido_session_state_event_t event = {};
+    const char *safe_status = (status && strlen(status) > 0) ? status : "running";
+    const char *safe_phase = (phase && strlen(phase) > 0) ? phase : "active";
+
+    strncpy(event.status, safe_status, sizeof(event.status) - 1);
+    event.status[sizeof(event.status) - 1] = '\0';
+
+    strncpy(event.phase, safe_phase, sizeof(event.phase) - 1);
+    event.phase[sizeof(event.phase) - 1] = '\0';
+
+    BaseType_t ok = xQueueOverwrite(g_session_state_queue, &event);
+    if (ok != pdTRUE) {
+        ESP_LOGW(TAG, "Queue session-state piena");
+        return false;
+    }
+
+    return true;
+}
+
 bool bushido_send_session_state_to_backend(const char *status, const char *phase)
 {
     if (!wifi_connected) {
@@ -2012,7 +2045,7 @@ void bushido_sync_training_session_tick(void)
     }
 
     last_sync_ms = now_ms;
-    bushido_send_session_state_to_backend("running", bushido_backend_phase_string());
+    bushido_queue_session_state("running", bushido_backend_phase_string());
 }
 
 static esp_err_t bushido_register_wrist_peer(const uint8_t *mac)
@@ -2107,11 +2140,27 @@ static void bushido_send_hit_confirm_to_wrist_slot(int slot_index, int force_val
 
 void bushido_http_task(void *pvParameters)
 {
-    bushido_hit_event_t event;
+    bushido_hit_event_t hit_event;
+    bushido_session_state_event_t session_event;
+
     while (true)
     {
-        if (xQueueReceive(g_hit_queue, &event, portMAX_DELAY)) {
-            send_hit_to_backend(event.force_value, event.speed_ms, event.angle_deg, event.strike_type, event.zone);
+        bool did_work = false;
+
+        if (g_session_state_queue && xQueueReceive(g_session_state_queue, &session_event, 0) == pdPASS) {
+            bushido_send_session_state_to_backend(session_event.status, session_event.phase);
+            did_work = true;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        if (g_hit_queue && xQueueReceive(g_hit_queue, &hit_event, did_work ? 0 : pdMS_TO_TICKS(100)) == pdPASS) {
+            send_hit_to_backend(
+                hit_event.force_value,
+                hit_event.speed_ms,
+                hit_event.angle_deg,
+                hit_event.strike_type,
+                hit_event.zone
+            );
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -2533,6 +2582,11 @@ extern "C" void app_main(void)
     g_hit_queue = xQueueCreate(10, sizeof(bushido_hit_event_t));
     if (g_hit_queue == NULL) {
         ESP_LOGE(TAG, "Errore creazione coda hit");
+    }
+
+    g_session_state_queue = xQueueCreate(1, sizeof(bushido_session_state_event_t));
+    if (g_session_state_queue == NULL) {
+        ESP_LOGE(TAG, "Errore creazione coda session-state");
     }
 
     g_http_mutex = xSemaphoreCreateMutex();
