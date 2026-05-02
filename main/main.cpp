@@ -555,7 +555,9 @@ static void bushido_training_pause(void)
 
 static void bushido_training_stop(void)
 {
-    bool should_notify_end = bushido_backend_session_active;
+    bool should_notify_end =
+        bushido_backend_session_active ||
+        (bushido_training_started_at_ms > 0);
 
     if (should_notify_end) {
         bushido_queue_session_state("ended", "completed");
@@ -2188,14 +2190,21 @@ void bushido_sensor_task(void *pvParameters)
             int force_value = bushido_loadcell_raw_to_force_n(lc_abs);
             bool has_wrists = bushido_count_paired_wrists() > 0;
             bool consumed_by_training = false;
+            bool allow_hit_upload = bushido_training_running && !bushido_training_paused;
+
+            bushido_hit_active = true;
+            bushido_last_hit_ms = now_ms;
+
+            if (!allow_hit_upload) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
 
             if (bushido_training_running && !bushido_training_paused) {
                 consumed_by_training = bushido_training_handle_pad_hit(now_ms);
             }
 
             bushido_total_hits++;
-            bushido_hit_active = true;
-            bushido_last_hit_ms = now_ms;
 
             if (consumed_by_training) {
                 if (lvgl_port_lock(0)) {
