@@ -93,7 +93,7 @@ static char wifi_status_text[64] = "WiFi: INIZIALIZZAZIONE...";
 #define BUSHIDO_SENSOR_GPIO              GPIO_NUM_11
 #define BUSHIDO_SENSOR_ADC_UNIT          ADC_UNIT_2
 #define BUSHIDO_SENSOR_ADC_CHANNEL       ADC_CHANNEL_0
-#define BUSHIDO_HIT_COOLDOWN_MS          200
+#define BUSHIDO_HIT_COOLDOWN_MS          350
 #define BUSHIDO_DEBUG_INTERVAL_MS        1000
 
 #define BUSHIDO_HX711_DATA_GPIO          GPIO_NUM_21
@@ -555,11 +555,7 @@ static void bushido_training_pause(void)
 
 static void bushido_training_stop(void)
 {
-    bool should_notify_end =
-        bushido_backend_session_active ||
-        bushido_training_running ||
-        bushido_training_paused ||
-        (bushido_training_started_at_ms > 0);
+    bool should_notify_end = bushido_backend_session_active;
 
     if (should_notify_end) {
         bushido_queue_session_state("ended", "completed");
@@ -1813,7 +1809,7 @@ void send_hit_to_backend(int force_value, float speed_value, int angle_deg, cons
     esp_http_client_config_t config = {};
     config.url = BUSHIDO_BACKEND_HIT_URL;
     config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 4000;
+    config.timeout_ms = 2000;
     config.crt_bundle_attach = esp_crt_bundle_attach;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -1833,16 +1829,8 @@ void send_hit_to_backend(int force_value, float speed_value, int angle_deg, cons
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         ESP_LOGI(TAG, "HTTP Status: %d", status);
-        if (lvgl_port_lock(0)) {
-            bushido_set_wifi_text("WiFi: hit inviato");
-            lvgl_port_unlock();
-        }
     } else {
         ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
-        if (lvgl_port_lock(0)) {
-            bushido_set_wifi_text("WiFi: errore invio");
-            lvgl_port_unlock();
-        }
     }
 
     esp_http_client_cleanup(client);
@@ -2033,19 +2021,7 @@ bool bushido_send_session_state_to_backend(const char *status, const char *phase
 
 void bushido_sync_training_session_tick(void)
 {
-    static unsigned long last_sync_ms = 0;
-
-    if (!wifi_connected || !bushido_training_running || bushido_training_paused) {
-        return;
-    }
-
-    unsigned long now_ms = (unsigned long)esp_log_timestamp();
-    if ((now_ms - last_sync_ms) < 1500UL) {
-        return;
-    }
-
-    last_sync_ms = now_ms;
-    bushido_queue_session_state("running", bushido_backend_phase_string());
+    return;
 }
 
 static esp_err_t bushido_register_wrist_peer(const uint8_t *mac)
@@ -2251,8 +2227,8 @@ void bushido_sensor_task(void *pvParameters)
                     strncpy(event.wrist_device_id, "-", sizeof(event.wrist_device_id) - 1);
                     event.wrist_device_id[sizeof(event.wrist_device_id) - 1] = '\0';
 
-                    if (xQueueSend(g_hit_queue, &event, 0) != pdPASS) {
-                        ESP_LOGW(TAG, "Coda hit piena, evento scartato");
+                    if (xQueueOverwrite(g_hit_queue, &event) != pdPASS) {
+                        ESP_LOGW(TAG, "Overwrite hit queue fallito");
                     }
                 }
 
@@ -2311,8 +2287,8 @@ void bushido_sensor_task(void *pvParameters)
                 strncpy(event.wrist_device_id, fused_device_id, sizeof(event.wrist_device_id) - 1);
                 event.wrist_device_id[sizeof(event.wrist_device_id) - 1] = '\0';
 
-                if (xQueueSend(g_hit_queue, &event, 0) != pdPASS) {
-                    ESP_LOGW(TAG, "Coda hit piena, evento scartato");
+                if (xQueueOverwrite(g_hit_queue, &event) != pdPASS) {
+                    ESP_LOGW(TAG, "Overwrite hit queue fallito");
                 }
             }
 
@@ -2579,7 +2555,7 @@ extern "C" void app_main(void)
         lvgl_port_unlock();
     }
 
-    g_hit_queue = xQueueCreate(10, sizeof(bushido_hit_event_t));
+    g_hit_queue = xQueueCreate(1, sizeof(bushido_hit_event_t));
     if (g_hit_queue == NULL) {
         ESP_LOGE(TAG, "Errore creazione coda hit");
     }
